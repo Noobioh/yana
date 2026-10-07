@@ -5,6 +5,7 @@
 //! That way saving never silently drops content the user wrote elsewhere.
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+pub use pulldown_cmark::Alignment;
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -15,8 +16,13 @@ pub enum Kind {
     Image { src: String, alt: String },
     /// Fenced code block; text is the code, without fences.
     Code { lang: String },
+    /// GFM table: cells separated by '\t', rows by '\n'; the first row is the header.
+    Table { align: Vec<Alignment> },
     Raw,
 }
+
+pub const CELL: char = '\t';
+pub const ROW: char = '\n';
 
 impl Kind {
     /// Blocks whose text is stored as-is: newlines allowed, no inline formatting.
@@ -60,6 +66,46 @@ impl Block {
 
     pub fn raw(text: &str) -> Self {
         Block::verbatim(Kind::Raw, text)
+    }
+
+    pub fn table(align: Vec<Alignment>, rows: Vec<Vec<Vec<Span>>>) -> Self {
+        let sep = |c: char| Span { text: c.into(), style: Style::default() };
+        let mut spans = vec![];
+        for (r, row) in rows.into_iter().enumerate() {
+            if r > 0 {
+                spans.push(sep(ROW));
+            }
+            for (c, cell) in row.into_iter().enumerate() {
+                if c > 0 {
+                    spans.push(sep(CELL));
+                }
+                spans.extend(cell);
+            }
+        }
+        Block::new(Kind::Table { align }, spans)
+    }
+
+    /// Byte range of every table cell, by row.
+    pub fn cells(&self) -> Vec<Vec<Range<usize>>> {
+        let text = self.text();
+        let mut rows = vec![vec![]];
+        let mut start = 0;
+        for (i, c) in text.char_indices().chain([(text.len(), ROW)]) {
+            if c == CELL || c == ROW {
+                rows.last_mut().unwrap().push(start..i);
+                start = i + 1;
+                if c == ROW {
+                    rows.push(vec![]);
+                }
+            }
+        }
+        rows.pop();
+        rows
+    }
+
+    /// Table as rows of cells of spans; inverse of `Block::table`.
+    pub fn grid(&self) -> Vec<Vec<Vec<Span>>> {
+        self.cells().into_iter().map(|row| row.into_iter().map(|c| self.slice(c)).collect()).collect()
     }
 
     pub fn verbatim(kind: Kind, text: &str) -> Self {
@@ -184,6 +230,10 @@ pub fn parse(src: &str) -> Vec<Block> {
                     .collect();
                 blocks.push(Block::verbatim(Kind::Code { lang }, code.strip_suffix('\n').unwrap_or(&code)));
             }
+            Event::Start(Tag::Table(align)) => match table(src, &ev[i..=end], align) {
+                Some(b) => blocks.push(b),
+                None => blocks.push(Block::raw(src[ev[i].1.clone()].trim_end())),
+            },
             Event::Start(Tag::List(_)) => match list(src, &ev, i, 0) {
                 Some(items) => blocks.extend(items),
                 None => blocks.push(Block::raw(src[ev[i].1.clone()].trim_end())),
@@ -257,6 +307,30 @@ fn list(src: &str, ev: &[(Event, Range<usize>)], i: usize, depth: u8) -> Option<
         j = item_end + 1;
     }
     Some(out)
+}
+
+/// Table events (Start(Table) ..= End(Table)) -> Table block.
+fn table(src: &str, ev: &[(Event, Range<usize>)], align: &[Alignment]) -> Option<Block> {
+    let mut rows: Vec<Vec<Vec<Span>>> = vec![];
+    let mut j = 1;
+    while j < ev.len() {
+        match &ev[j].0 {
+            Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(vec![]),
+            Event::Start(Tag::TableCell) => {
+                let e = end_of(ev, j);
+                // a non-Paragraph kind keeps images inline (as raw source)
+                let cell = inline(src, &ev[j + 1..e], Kind::Table { align: vec![] }).pop()?;
+                rows.last_mut()?.push(cell.spans);
+                j = e;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    for row in &mut rows {
+        row.resize(align.len(), vec![]);
+    }
+    Some(Block::table(align.to_vec(), rows))
 }
 
 fn is_block_tag(t: &Tag) -> bool {
@@ -396,6 +470,21 @@ pub fn serialize(blocks: &[Block]) -> String {
                 let fence = "`".repeat(longest_run(&code, '`').max(2) + 1);
                 format!("{fence}{lang}\n{code}\n{fence}")
             }
+            Kind::Table { align } => {
+                let row = |cells: &[Range<usize>]| {
+                    let cells: Vec<String> = cells.iter().map(|c| escape_pipes(&inline_md(&b.slice(c.clone())))).collect();
+                    format!("| {} |", cells.join(" | "))
+                };
+                let rule = align.iter().map(|a| match a {
+                    Alignment::None => "---",
+                    Alignment::Left => ":---",
+                    Alignment::Center => ":---:",
+                    Alignment::Right => "---:",
+                });
+                let mut lines: Vec<String> = b.cells().iter().map(|r| row(r)).collect();
+                lines.insert(1.min(lines.len()), format!("|{}|", rule.collect::<Vec<_>>().join("|")));
+                lines.join("\n")
+            }
             Kind::Raw => b.text(),
         };
         let is_list = matches!(b.kind, Kind::List { .. });
@@ -522,6 +611,20 @@ fn marks_md(spans: &[Span]) -> String {
     out
 }
 
+/// `|` ends a table cell, even inside code spans; escape those not escaped yet.
+fn escape_pipes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut backslashes = 0;
+    for c in s.chars() {
+        if c == '|' && backslashes % 2 == 0 {
+            out.push('\\');
+        }
+        backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+        out.push(c);
+    }
+    out
+}
+
 fn longest_run(s: &str, c: char) -> usize {
     let (mut best, mut cur) = (0, 0);
     for ch in s.chars() {
@@ -582,6 +685,18 @@ mod tests {
         assert_eq!(roundtrip("````\na ``` b\n````\n"), "````\na ``` b\n````\n");
         assert_eq!(roundtrip("    indented\n"), "```\nindented\n```\n");
         assert_eq!(roundtrip("```\n```\n"), "```\n\n```\n");
+    }
+
+    #[test]
+    fn tables() {
+        let md = "| a | **b** |\n|---|:---:|\n| `x\\|y` | [l](u) |\n|  | 2 |\n";
+        assert_eq!(roundtrip(md), md);
+        let b = &parse(md)[0];
+        assert_eq!(b.kind, Kind::Table { align: vec![Alignment::None, Alignment::Center] });
+        assert_eq!(b.text(), "a\tb\nx|y\tl\n\t2");
+        assert_eq!(b.cells()[2], vec![10..10, 11..12]);
+        // ragged rows are padded to the header
+        assert_eq!(roundtrip("| a | b |\n|---|---|\n| 1 |\n"), "| a | b |\n|---|---|\n| 1 |  |\n");
     }
 
     #[test]

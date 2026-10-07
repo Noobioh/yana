@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 dirs = "7.0.0"
+genpdf = { version = "0.2.0", features = ["images"] }
 iced = { version = "0.14.0", features = ["image", "advanced", "tokio", "svg"] }
+image023 = { version = "0.23", package = "image", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 pulldown-cmark = "0.13.4"
 resvg = "0.45.1"
 rfd = "0.17.2"

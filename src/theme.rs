@@ -9,13 +9,19 @@ pub const SANS: Font = Font::with_name("IBM Plex Sans");
 pub const MONO: Font = Font::with_name("IBM Plex Mono");
 pub const ICONS: Font = Font::with_name("lucide");
 
+pub const SANS_REGULAR: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
+pub const SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf");
+pub const SANS_ITALIC: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Italic.ttf");
+pub const SANS_SEMIBOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-SemiBoldItalic.ttf");
+pub const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
+
 pub const FONTS: [&[u8]; 7] = [
-    include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+    SANS_REGULAR,
     include_bytes!("../assets/fonts/IBMPlexSans-Medium.ttf"),
-    include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf"),
-    include_bytes!("../assets/fonts/IBMPlexSans-Italic.ttf"),
-    include_bytes!("../assets/fonts/IBMPlexSans-SemiBoldItalic.ttf"),
-    include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+    SANS_SEMIBOLD,
+    SANS_ITALIC,
+    SANS_SEMIBOLD_ITALIC,
+    MONO_REGULAR,
     include_bytes!("../assets/fonts/lucide.ttf"),
 ];
 
@@ -424,6 +430,7 @@ pub mod i {
     pub const TRASH: char = '\u{e18e}';
     pub const LIST: char = '\u{e10c}';
     pub const LIST_ORDERED: char = '\u{e1d1}';
+    pub const TABLE: char = '\u{e181}';
     pub const LINK: char = '\u{e108}';
     pub const IMAGE: char = '\u{e0f9}';
     pub const CODE: char = '\u{e097}';
