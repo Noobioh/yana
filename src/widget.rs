@@ -2,7 +2,7 @@
 //! keyboard input into `Action`s. Uses the concrete cosmic-text buffer behind
 //! iced's paragraph for exact caret, hit-test and selection geometry.
 
-use crate::doc::{Block, Kind};
+use crate::doc::{Alignment, Block, Kind};
 use crate::editor::{Action, Editor, Mark, Motion, Pos};
 use crate::theme::{self, Pal};
 use iced::advanced::graphics::text::{Paragraph, cosmic_text};
@@ -13,6 +13,7 @@ use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, clipboard, layout, mouse};
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::{Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Theme, alignment, font};
+use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ const LINE: f32 = 1.7;
 const INDENT: f32 = 26.0;
 const RAW_PAD: f32 = 10.0;
 const MAX_IMAGE_H: f32 = 480.0;
+const CELL_PAD: f32 = 8.0;
+const MIN_COL: f32 = 48.0;
 /// Clickable space below the last block (places the caret at the end).
 const BOTTOM: f32 = 200.0;
 
@@ -47,6 +50,25 @@ struct Laid {
     top: f32,
     height: f32,
     image: Option<(img::Handle, Size)>,
+    /// Table cells; empty for other blocks.
+    cells: Vec<Cell>,
+}
+
+struct Cell {
+    para: Paragraph,
+    /// Cell box, relative to the block origin; text starts at `rect` + CELL_PAD.
+    rect: Rectangle,
+    /// Byte range of the cell's text in the block.
+    range: Range<usize>,
+    header: bool,
+    /// Horizontal offset of the text for centered/right-aligned columns.
+    shift: f32,
+}
+
+impl Cell {
+    fn text_origin(&self) -> Point {
+        Point::new(self.rect.x + CELL_PAD + self.shift, self.rect.y + CELL_PAD)
+    }
 }
 
 #[derive(Default)]
@@ -104,6 +126,69 @@ fn spans(b: &Block, pal: Pal) -> Vec<text::Span<'static, (), Font>> {
         .collect()
 }
 
+fn paragraph(spans: &[text::Span<'static, (), Font>], width: f32, size: f32, wrapping: text::Wrapping) -> Paragraph {
+    Paragraph::with_spans(text::Text {
+        content: spans,
+        bounds: Size::new(width, f32::INFINITY),
+        size: Pixels(size),
+        line_height: text::LineHeight::Relative(LINE),
+        font: theme::SANS,
+        align_x: text::Alignment::Default,
+        align_y: alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping,
+    })
+}
+
+/// Table grid filling `width`: columns share it by content width, rows are as
+/// tall as their tallest cell. Returns the cells and the total height.
+fn table_cells(b: &Block, pal: Pal, width: f32) -> (Vec<Cell>, f32) {
+    let Kind::Table { align } = &b.kind else { return (vec![], 0.0) };
+    let rows = b.cells();
+    let cols = align.len();
+    let cell_spans = |r: usize, range: &Range<usize>| {
+        let mut sp = spans(&Block::new(Kind::Paragraph, b.slice(range.clone())), pal);
+        if r == 0 {
+            sp.iter_mut().for_each(|s| s.font = s.font.map(|f| Font { weight: font::Weight::Semibold, ..f }));
+        }
+        sp
+    };
+    let mut natural = vec![MIN_COL; cols];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, range) in row.iter().enumerate() {
+            let w = paragraph(&cell_spans(r, range), f32::INFINITY, SIZE, text::Wrapping::None).min_bounds().width;
+            natural[c] = natural[c].max(w + 2.0 * CELL_PAD);
+        }
+    }
+    let total: f32 = natural.iter().sum();
+    let col_w: Vec<f32> = natural.iter().map(|n| n * width / total).collect();
+    let mut cells = vec![];
+    let mut y = 0.0;
+    for (r, row) in rows.iter().enumerate() {
+        let first = cells.len();
+        let mut x = 0.0;
+        let mut h: f32 = SIZE * LINE;
+        for (c, range) in row.iter().enumerate() {
+            let inner = (col_w[c] - 2.0 * CELL_PAD).max(10.0);
+            let para = paragraph(&cell_spans(r, range), inner, SIZE, text::Wrapping::WordOrGlyph);
+            h = h.max(para.min_bounds().height);
+            // align by moving the text origin, so caret and hit-testing need no special case
+            let free = inner - para.min_bounds().width;
+            let shift = match align[c] {
+                Alignment::Center => free / 2.0,
+                Alignment::Right => free,
+                _ => 0.0,
+            };
+            cells.push(Cell { para, rect: Rectangle::new(Point::new(x, y), Size::new(col_w[c], 0.0)), shift, range: range.clone(), header: r == 0 });
+            x += col_w[c];
+        }
+        let h = h + 2.0 * CELL_PAD;
+        cells[first..].iter_mut().for_each(|cell| cell.rect.height = h);
+        y += h;
+    }
+    (cells, y)
+}
+
 impl<M> EditorView<'_, M> {
     fn build(&self, b: &Block, width: f32, renderer: &iced::Renderer) -> Laid {
         let left = match b.kind {
@@ -114,18 +199,13 @@ impl<M> EditorView<'_, M> {
         let w = (width - left - if b.kind.is_verbatim() { RAW_PAD } else { 0.0 }).max(10.0);
         let size = block_size(b);
         let spans = spans(b, self.pal);
-        let para = Paragraph::with_spans(text::Text {
-            content: &spans[..],
-            bounds: Size::new(w, f32::INFINITY),
-            size: Pixels(size),
-            line_height: text::LineHeight::Relative(LINE),
-            font: theme::SANS,
-            align_x: text::Alignment::Default,
-            align_y: alignment::Vertical::Top,
-            shaping: text::Shaping::Advanced,
-            wrapping: if b.kind.is_verbatim() { text::Wrapping::Glyph } else { text::Wrapping::WordOrGlyph },
-        });
+        let wrapping = if b.kind.is_verbatim() { text::Wrapping::Glyph } else { text::Wrapping::WordOrGlyph };
+        let para = paragraph(&spans, w, size, wrapping);
         let mut height = para.min_bounds().height.max(size * LINE);
+        let mut cells = vec![];
+        if let Kind::Table { .. } = b.kind {
+            (cells, height) = table_cells(b, self.pal, w);
+        }
         let mut image = None;
         if let Kind::Image { src, .. } = &b.kind {
             let handle = img::Handle::from_path(self.base.join(src));
@@ -138,7 +218,7 @@ impl<M> EditorView<'_, M> {
                 image = Some((handle, size));
             }
         }
-        Laid { block: b.clone(), width, pal: self.pal, para, left, top: 0.0, height, image }
+        Laid { block: b.clone(), width, pal: self.pal, para, left, top: 0.0, height, image, cells }
     }
 
     fn key_actions(&self, state: &State, key: &Key, mods: Modifiers, text: Option<&str>, clipboard: &mut dyn Clipboard) -> Option<Vec<Action>> {
@@ -277,6 +357,18 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                     },
                     pal.raised,
                 ),
+                Kind::Table { .. } => {
+                    for cell in &l.cells {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: cell.rect + origin_vec(origin),
+                                border: Border { color: pal.line, width: 1.0, radius: 0.0.into() },
+                                ..Default::default()
+                            },
+                            if cell.header { pal.raised } else { Color::TRANSPARENT },
+                        );
+                    }
+                }
                 Kind::Image { src, .. } => match &l.image {
                     Some((handle, size)) => {
                         renderer.draw_image(img::Image::new(handle.clone()), Rectangle::new(origin, *size), *viewport)
@@ -311,7 +403,12 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                     renderer.fill_quad(quad(r + origin_vec(origin)), selection);
                 }
             }
-            renderer.fill_paragraph(&l.para, origin, style.text_color, *viewport);
+            if l.cells.is_empty() {
+                renderer.fill_paragraph(&l.para, origin, style.text_color, *viewport);
+            }
+            for cell in &l.cells {
+                renderer.fill_paragraph(&cell.para, cell.text_origin() + origin_vec(origin), style.text_color, *viewport);
+            }
         }
         if self.editor.focused {
             if let Some(l) = state.laid.get(self.editor.cursor.block) {
@@ -443,8 +540,20 @@ fn from_line(text: &str, line: usize, index: usize) -> usize {
 
 /// Caret (x, top, height) relative to the block origin.
 fn caret(l: &Laid, offset: usize) -> (f32, f32, f32) {
-    let (line, idx) = to_line(&l.block.text(), offset);
-    let runs: Vec<_> = l.para.buffer().layout_runs().filter(|r| r.line_i == line).collect();
+    let text = l.block.text();
+    match l.cells.iter().find(|c| offset <= c.range.end) {
+        Some(cell) => {
+            let o = cell.text_origin();
+            let (x, y, h) = caret_in(&cell.para, &text[cell.range.clone()], offset - cell.range.start, SIZE);
+            (o.x + x, o.y + y, h)
+        }
+        None => caret_in(&l.para, &text, offset, block_size(&l.block)),
+    }
+}
+
+fn caret_in(para: &Paragraph, text: &str, offset: usize, size: f32) -> (f32, f32, f32) {
+    let (line, idx) = to_line(text, offset);
+    let runs: Vec<_> = para.buffer().layout_runs().filter(|r| r.line_i == line).collect();
     for (k, run) in runs.iter().enumerate() {
         let end = run.glyphs.last().map_or(0, |g| g.end);
         if idx < end || k + 1 == runs.len() {
@@ -457,15 +566,31 @@ fn caret(l: &Laid, offset: usize) -> (f32, f32, f32) {
             return (x, run.line_top, run.line_height);
         }
     }
-    (0.0, 0.0, block_size(&l.block) * LINE)
+    (0.0, 0.0, size * LINE)
 }
 
 fn highlight(l: &Laid, s: usize, e: usize) -> Vec<Rectangle> {
     let text = l.block.text();
-    let ((l1, i1), (l2, i2)) = (to_line(&text, s), to_line(&text, e));
+    if l.cells.is_empty() {
+        return highlight_in(&l.para, &text, s, e, block_size(&l.block));
+    }
+    let mut rects = vec![];
+    for cell in &l.cells {
+        let r = &cell.range;
+        let (cs, ce) = (s.max(r.start), e.min(r.end));
+        // partly selected cells, and fully selected empty ones (as a sliver)
+        if cs < ce || (r.is_empty() && s <= r.start && r.end < e) {
+            let o = origin_vec(cell.text_origin());
+            rects.extend(highlight_in(&cell.para, &text[r.clone()], cs - r.start, ce - r.start, SIZE).into_iter().map(|x| x + o));
+        }
+    }
+    rects
+}
+
+fn highlight_in(para: &Paragraph, text: &str, s: usize, e: usize, size: f32) -> Vec<Rectangle> {
+    let ((l1, i1), (l2, i2)) = (to_line(text, s), to_line(text, e));
     let (c1, c2) = (cosmic_text::Cursor::new(l1, i1), cosmic_text::Cursor::new(l2, i2));
-    let mut rects: Vec<Rectangle> = l
-        .para
+    let mut rects: Vec<Rectangle> = para
         .buffer()
         .layout_runs()
         .filter_map(|run| {
@@ -475,7 +600,7 @@ fn highlight(l: &Laid, s: usize, e: usize) -> Vec<Rectangle> {
         .collect();
     if rects.is_empty() && text.is_empty() {
         // selected empty block: show a sliver so the selection reads as continuous
-        rects.push(Rectangle::new(Point::ORIGIN, Size::new(4.0, block_size(&l.block) * LINE)));
+        rects.push(Rectangle::new(Point::ORIGIN, Size::new(4.0, size * LINE)));
     }
     rects
 }
@@ -483,8 +608,21 @@ fn highlight(l: &Laid, s: usize, e: usize) -> Vec<Rectangle> {
 /// Point relative to the block origin -> byte offset.
 fn hit(l: &Laid, p: Point) -> usize {
     let text = l.block.text();
-    match l.para.buffer().hit(p.x, p.y) {
-        Some(c) => from_line(&text, c.line, c.index),
+    if l.cells.is_empty() {
+        return hit_in(&l.para, &text, p);
+    }
+    // the row under p (or the last), then the column under p (or the last)
+    let last = l.cells.last().unwrap();
+    let row_y = l.cells.iter().find(|c| p.y < c.rect.y + c.rect.height).unwrap_or(last).rect.y;
+    let row: Vec<&Cell> = l.cells.iter().filter(|c| c.rect.y == row_y).collect();
+    let cell = row.iter().find(|c| p.x < c.rect.x + c.rect.width).unwrap_or(row.last().unwrap());
+    let o = cell.text_origin();
+    cell.range.start + hit_in(&cell.para, &text[cell.range.clone()], Point::new(p.x - o.x, p.y - o.y))
+}
+
+fn hit_in(para: &Paragraph, text: &str, p: Point) -> usize {
+    match para.buffer().hit(p.x, p.y) {
+        Some(c) => from_line(text, c.line, c.index),
         None if p.y < 0.0 => 0,
         None => text.len(),
     }

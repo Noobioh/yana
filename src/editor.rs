@@ -1,7 +1,8 @@
 //! Editing state and operations on the document model. No UI here: the
 //! widget translates input into `Action`s, `Editor::perform` applies them.
 
-use crate::doc::{self, Block, Kind, Style};
+use crate::doc::{self, Alignment, Block, CELL, Kind, ROW, Style};
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
@@ -28,6 +29,14 @@ pub enum Mark {
     Italic,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TableOp {
+    AddRow,
+    RemoveRow,
+    AddColumn,
+    RemoveColumn,
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Focus(bool),
@@ -46,6 +55,9 @@ pub enum Action {
     Outdent,
     SetLink(String),
     InsertImage { src: String, alt: String },
+    InsertTable,
+    /// Row/column edit on the table under the cursor.
+    Table(TableOp),
     Paste(String),
     Undo,
     Redo,
@@ -186,11 +198,16 @@ impl Editor {
             Action::Backspace => self.edit(false, Self::backspace),
             Action::Delete => self.edit(false, Self::delete_forward),
             Action::SetKind(kind) => self.edit(false, |e| e.set_kind(kind)),
+            Action::Indent if self.in_table() => self.next_cell(true),
+            Action::Outdent if self.in_table() => self.next_cell(false),
             Action::Indent if self.blocks[self.cursor.block].kind.is_verbatim() => self.edit(false, |e| e.insert("    ")),
             Action::Indent => self.edit(false, |e| e.indent(1)),
             Action::Outdent => self.edit(false, |e| e.indent(-1)),
             Action::SetLink(url) => self.edit(false, |e| e.set_link(url)),
             Action::InsertImage { src, alt } => self.edit(false, |e| e.insert_image(src, alt)),
+            Action::InsertTable => self.edit(false, Self::insert_table),
+            Action::Table(op) if self.in_table() => self.edit(false, |e| e.table_op(op)),
+            Action::Table(_) => {}
             Action::Paste(text) => self.edit(false, |e| e.paste(&text)),
         }
         self.revision != rev
@@ -271,6 +288,8 @@ impl Editor {
                 let word = rest[skip..].find(|ch: char| !ch.is_alphanumeric()).unwrap_or(rest.len() - skip);
                 Pos { offset: c.offset + skip + word, ..c }
             }
+            Motion::Home if self.in_table() => Pos { offset: self.cell_range(c).start, ..c },
+            Motion::End if self.in_table() => Pos { offset: self.cell_range(c).end, ..c },
             Motion::Home => Pos { offset: 0, ..c },
             Motion::End => self.end_of(c.block),
             Motion::DocStart => Pos::default(),
@@ -295,8 +314,23 @@ impl Editor {
 
     fn delete_selection(&mut self) -> bool {
         let Some((a, b)) = self.selection() else { return false };
+        let ranges: Vec<_> = (a.block..=b.block).map(|i| (i, self.selected_range(i).unwrap())).collect();
         self.anchor = None;
         self.cursor = a;
+        if is_table(&self.blocks[a.block]) || is_table(&self.blocks[b.block]) {
+            // no merging into or out of a table: clear what's selected, drop what's fully selected
+            for (i, (s, e)) in ranges.into_iter().rev() {
+                let blk = &mut self.blocks[i];
+                if (s == 0 && e == blk.len()) || (i != a.block && i != b.block) {
+                    self.blocks.remove(i);
+                } else if is_table(blk) {
+                    delete_keeping_cells(blk, s..e);
+                } else {
+                    blk.delete(s..e);
+                }
+            }
+            return true;
+        }
         if a.block == b.block {
             self.blocks[a.block].delete(a.offset..b.offset);
             return true;
@@ -318,6 +352,9 @@ impl Editor {
 
     fn insert(&mut self, text: &str) {
         self.delete_selection();
+        if self.blocks.is_empty() {
+            self.blocks.push(Block::paragraph());
+        }
         let c = self.cursor;
         if matches!(self.blocks[c.block].kind, Kind::Image { .. }) {
             self.blocks.insert(c.block + 1, Block::paragraph());
@@ -365,6 +402,18 @@ impl Editor {
                 self.blocks.insert(c.block + 1, Block::paragraph());
                 self.cursor = Pos { block: c.block + 1, offset: 0 };
             }
+            // Enter adds a row; on an empty last row it leaves the table
+            Kind::Table { .. } => {
+                let rows = b.cells();
+                let r = rows.iter().position(|row| c.offset <= row.last().unwrap().end).unwrap_or(0);
+                if r > 0 && r + 1 == rows.len() && rows[r].iter().all(|x| x.is_empty()) {
+                    self.table_op(TableOp::RemoveRow);
+                    self.blocks.insert(c.block + 1, Block::paragraph());
+                    self.cursor = Pos { block: c.block + 1, offset: 0 };
+                } else {
+                    self.table_op(TableOp::AddRow);
+                }
+            }
             // ```lang + Enter starts a code block
             Kind::Paragraph if c.offset == b.len() && b.text().starts_with("```") => {
                 let lang = b.text()[3..].trim().to_string();
@@ -396,12 +445,26 @@ impl Editor {
         }
         let c = self.cursor;
         let prev_is_image = c.block > 0 && matches!(self.blocks[c.block - 1].kind, Kind::Image { .. });
+        let prev_is_table = c.block > 0 && is_table(&self.blocks[c.block - 1]);
         let b = &mut self.blocks[c.block];
         match b.kind {
             Kind::Image { .. } => {
                 self.blocks.remove(c.block);
                 self.cursor = if c.block > 0 { self.end_of(c.block - 1) } else { Pos::default() };
             }
+            // an empty table goes away; otherwise never delete a cell separator, step over it
+            Kind::Table { .. } if c.offset == 0 && b.text().chars().all(|ch| ch == CELL || ch == ROW) => {
+                *b = Block::paragraph();
+            }
+            Kind::Table { .. } if c.offset > 0 => {
+                let text = b.text();
+                let p = prev_boundary(&text, c.offset);
+                if !text[p..].starts_with([CELL, ROW]) {
+                    b.delete(p..c.offset);
+                }
+                self.cursor.offset = p;
+            }
+            Kind::Table { .. } => {}
             _ if c.offset > 0 => {
                 let p = prev_boundary(&b.text(), c.offset);
                 b.delete(p..c.offset);
@@ -416,6 +479,12 @@ impl Editor {
                 self.blocks.remove(c.block - 1);
                 self.cursor.block -= 1;
             }
+            _ if prev_is_table => {
+                if b.len() == 0 {
+                    self.blocks.remove(c.block);
+                }
+                self.cursor = self.end_of(c.block - 1);
+            }
             _ => self.merge_into_previous(c.block),
         }
     }
@@ -429,11 +498,19 @@ impl Editor {
         let text = b.text();
         if matches!(b.kind, Kind::Image { .. }) {
             self.blocks.remove(c.block);
+        } else if is_table(b) {
+            if c.offset < text.len() && !text[c.offset..].starts_with([CELL, ROW]) {
+                b.delete(c.offset..next_boundary(&text, c.offset));
+            }
         } else if c.offset < text.len() {
             b.delete(c.offset..next_boundary(&text, c.offset));
         } else if c.block + 1 < self.blocks.len() {
             if matches!(self.blocks[c.block + 1].kind, Kind::Image { .. }) {
                 self.blocks.remove(c.block + 1);
+            } else if is_table(&self.blocks[c.block + 1]) {
+                if self.blocks[c.block].len() == 0 {
+                    self.blocks.remove(c.block);
+                }
             } else {
                 self.merge_into_previous(c.block + 1);
             }
@@ -490,7 +567,7 @@ impl Editor {
         let all = range.clone().all(|i| same(&self.blocks[i].kind, &kind));
         for i in range {
             let b = &mut self.blocks[i];
-            if matches!(b.kind, Kind::Image { .. }) || b.kind.is_verbatim() {
+            if matches!(b.kind, Kind::Image { .. } | Kind::Table { .. }) || b.kind.is_verbatim() {
                 continue;
             }
             b.kind = match (&b.kind, &kind) {
@@ -516,7 +593,10 @@ impl Editor {
             let text: Vec<String> = range
                 .clone()
                 .filter(|&i| !matches!(self.blocks[i].kind, Kind::Image { .. }))
-                .map(|i| self.blocks[i].text())
+                .map(|i| match self.blocks[i].kind {
+                    Kind::Table { .. } => doc::serialize(&self.blocks[i..=i]).trim_end().to_string(),
+                    _ => self.blocks[i].text(),
+                })
                 .collect();
             vec![Block::verbatim(Kind::Code { lang: String::new() }, &text.join("\n"))]
         };
@@ -567,6 +647,9 @@ impl Editor {
         let img = if b.kind == Kind::Paragraph && b.len() == 0 {
             *b = image;
             c.block
+        } else if is_table(b) {
+            self.blocks.insert(c.block + 1, image);
+            c.block + 1
         } else if c.offset == 0 && !matches!(b.kind, Kind::Image { .. }) {
             self.blocks.insert(c.block, image);
             c.block
@@ -585,9 +668,107 @@ impl Editor {
         self.cursor = Pos { block: img + 1, offset: 0 };
     }
 
+    fn in_table(&self) -> bool {
+        is_table(&self.blocks[self.cursor.block])
+    }
+
+    /// (row, column) of the table cell holding `p`.
+    fn cell_at(&self, p: Pos) -> (usize, usize) {
+        let rows = self.blocks[p.block].cells();
+        for (r, row) in rows.iter().enumerate() {
+            if let Some(c) = row.iter().position(|cell| p.offset <= cell.end) {
+                return (r, c);
+            }
+        }
+        (rows.len() - 1, rows.last().map_or(0, |r| r.len() - 1))
+    }
+
+    fn cell_range(&self, p: Pos) -> Range<usize> {
+        let (r, c) = self.cell_at(p);
+        self.blocks[p.block].cells()[r][c].clone()
+    }
+
+    /// Tab / Shift+Tab: to the end of the next/previous cell; Tab in the last cell adds a row.
+    fn next_cell(&mut self, forward: bool) {
+        let c = self.cursor;
+        let cells: Vec<Range<usize>> = self.blocks[c.block].cells().into_iter().flatten().collect();
+        let k = cells.iter().position(|cell| c.offset <= cell.end).unwrap_or(0);
+        match if forward { cells.get(k + 1) } else { k.checked_sub(1).map(|k| &cells[k]) } {
+            Some(cell) => self.select(Pos { offset: cell.end, ..c }, false),
+            None if forward => self.edit(false, |e| e.table_op(TableOp::AddRow)),
+            None => {}
+        }
+    }
+
+    /// Removing the last row or column removes the table.
+    fn table_op(&mut self, op: TableOp) {
+        let i = self.cursor.block;
+        let Kind::Table { mut align } = self.blocks[i].kind.clone() else { return };
+        let (mut r, mut c) = self.cell_at(self.cursor);
+        let mut grid = self.blocks[i].grid();
+        match op {
+            TableOp::AddRow => {
+                r += 1;
+                c = 0;
+                grid.insert(r, vec![vec![]; align.len()]);
+            }
+            TableOp::AddColumn => {
+                c += 1;
+                align.insert(c, Alignment::None);
+                grid.iter_mut().for_each(|row| row.insert(c, vec![]));
+            }
+            TableOp::RemoveRow if grid.len() > 1 => {
+                grid.remove(r);
+                r = r.min(grid.len() - 1);
+            }
+            TableOp::RemoveColumn if align.len() > 1 => {
+                align.remove(c);
+                grid.iter_mut().for_each(|row| drop(row.remove(c)));
+                c = c.min(align.len() - 1);
+            }
+            TableOp::RemoveRow | TableOp::RemoveColumn => {
+                self.blocks[i] = Block::paragraph();
+                self.cursor = Pos { block: i, offset: 0 };
+                return;
+            }
+        }
+        self.blocks[i] = Block::table(align, grid);
+        self.anchor = None;
+        let cell = self.blocks[i].cells()[r][c].clone();
+        self.cursor = Pos { block: i, offset: cell.end };
+    }
+
+    fn insert_table(&mut self) {
+        self.delete_selection();
+        if self.blocks.is_empty() {
+            self.blocks.push(Block::paragraph());
+        }
+        let c = self.cursor;
+        let table = Block::table(vec![Alignment::None; 3], vec![vec![vec![]; 3]; 2]);
+        let b = &mut self.blocks[c.block];
+        let at = if b.kind == Kind::Paragraph && b.len() == 0 {
+            *b = table;
+            c.block
+        } else {
+            self.blocks.insert(c.block + 1, table);
+            c.block + 1
+        };
+        if at + 1 == self.blocks.len() {
+            self.blocks.push(Block::paragraph());
+        }
+        self.cursor = Pos { block: at, offset: 0 };
+    }
+
     fn paste(&mut self, text: &str) {
         self.delete_selection();
         let c = self.cursor;
+        if self.in_table() {
+            let line = text.replace([CELL, ROW, '\r'], " ");
+            let style = self.typing_style();
+            self.blocks[c.block].insert(c.offset, &line, style);
+            self.cursor.offset += line.len();
+            return;
+        }
         if self.blocks[c.block].kind.is_verbatim() {
             self.blocks[c.block].insert(c.offset, text, Style { raw: true, ..Style::default() });
             self.cursor.offset += text.len();
@@ -629,6 +810,21 @@ impl Editor {
             last.normalize();
         }
     }
+}
+
+fn is_table(b: &Block) -> bool {
+    matches!(b.kind, Kind::Table { .. })
+}
+
+/// Delete `range` from a table block, but keep the cell/row separators in it.
+fn delete_keeping_cells(b: &mut Block, range: Range<usize>) {
+    let text = b.text();
+    let mut end = range.end;
+    for (i, _) in text[range.clone()].rmatch_indices([CELL, ROW]) {
+        b.delete(range.start + i + 1..end);
+        end = range.start + i;
+    }
+    b.delete(range.start..end);
 }
 
 // ponytail: char boundaries, not grapheme clusters; emoji ZWJ sequences
@@ -726,6 +922,38 @@ mod tests {
         assert_eq!(e.markdown(), "```\none\ntwo\n```\n");
         e.perform(Action::SetKind(Kind::Code { lang: String::new() }));
         assert_eq!(e.markdown(), "one\n\ntwo\n");
+    }
+
+    #[test]
+    fn tables() {
+        let mut e = ed("");
+        e.perform(Action::InsertTable);
+        type_str(&mut e, "a");
+        e.perform(Action::Indent);
+        type_str(&mut e, "b");
+        e.perform(Action::Indent);
+        e.perform(Action::Indent); // last header cell -> new row
+        type_str(&mut e, "1");
+        assert_eq!(e.markdown(), "| a | b |  |\n|---|---|---|\n| 1 |  |  |\n");
+        // Backspace and Delete never eat a separator
+        e.perform(Action::Backspace);
+        e.perform(Action::Backspace);
+        e.perform(Action::Delete);
+        assert_eq!(e.markdown(), "| a | b |  |\n|---|---|---|\n|  |  |  |\n");
+        assert_eq!(e.cursor, Pos { block: 0, offset: 4 }, "stepped back over the row separator");
+        e.perform(Action::Select { pos: Pos { block: 0, offset: 5 }, extend: false }); // row 1, column 0
+        e.perform(Action::Table(TableOp::RemoveColumn));
+        e.perform(Action::Table(TableOp::AddRow));
+        assert_eq!(e.markdown(), "| b |  |\n|---|---|\n|  |  |\n|  |  |\n");
+        // Enter on the empty last row leaves the table
+        e.perform(Action::Enter);
+        type_str(&mut e, "after");
+        assert_eq!(e.markdown(), "| b |  |\n|---|---|\n|  |  |\n\nafter\n");
+        // a selection from inside the table into the paragraph keeps the table intact
+        e.perform(Action::Select { pos: Pos { block: 0, offset: 1 }, extend: false });
+        e.perform(Action::Select { pos: Pos { block: 1, offset: 2 }, extend: true });
+        e.perform(Action::Delete);
+        assert_eq!(e.markdown(), "| b |  |\n|---|---|\n|  |  |\n\nter\n");
     }
 
     #[test]

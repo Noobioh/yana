@@ -6,13 +6,14 @@ mod doc;
 mod editor;
 mod git;
 mod notes;
+mod pdf;
 mod tags;
 mod theme;
 mod widget;
 
 use config::{Config, Repo};
 use doc::Kind;
-use editor::{Action, Editor, Mark};
+use editor::{Action, Editor, Mark, TableOp};
 use iced::widget::{button, center, column, container, mouse_area, opaque, operation, pick_list, row, rule, scrollable, space, stack, svg, text, text_input};
 use iced::{Border, Color, Element, Fill, Subscription, Task, Theme, time, window};
 use tags::{Front, TagsFile};
@@ -141,6 +142,7 @@ enum Message {
     Delete,
     RemoveRepo,
     Export,
+    ExportPdf,
     InsertImage,
     SyncNow,
     Cloned(Result<Repo, String>),
@@ -373,6 +375,20 @@ impl App {
                     if let Err(e) = notes::export(&dir, &dest.join(&repo.name)) {
                         self.fail(e);
                     }
+                }
+            }
+            Message::ExportPdf => {
+                let Some(n) = &self.note else { return Task::none() };
+                let title = n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let picked = rfd::FileDialog::new()
+                    .set_title("Export as PDF")
+                    .add_filter("PDF", &["pdf"])
+                    .set_file_name(format!("{title}.pdf"))
+                    .save_file();
+                if let Some(dest) = picked
+                    && let Err(e) = pdf::export(&title, &n.editor.blocks, &n.dir, &dest)
+                {
+                    self.fail(e);
                 }
             }
             Message::InsertImage => {
@@ -1012,7 +1028,8 @@ impl App {
         let group = |items: Vec<Element<'static, Message>>| container(row(items).spacing(2)).padding(2).style(p.group());
         let heading = |n: u8| tool(label(["H1", "H2", "H3"][n as usize - 1]), Action::SetKind(Kind::Heading(n)), *kind == Kind::Heading(n));
         let list = |ordered: bool| matches!(kind, Kind::List { ordered: o, .. } if *o == ordered);
-        row![
+        let in_table = matches!(kind, Kind::Table { .. });
+        let mut bar = row![
             group(vec![
                 tool(text("B").size(13).font(weight(Semibold)).line_height(1.0).into(), Action::Toggle(Mark::Bold), false),
                 tool(text("I").size(13).font(iced::Font { style: iced::font::Style::Italic, ..theme::SANS }).line_height(1.0).into(), Action::Toggle(Mark::Italic), false),
@@ -1031,10 +1048,22 @@ impl App {
             group(vec![
                 tool(icon(i::LINK).into(), Action::RequestLink, false),
                 button(container(icon(i::IMAGE)).center_x(18)).padding([7, 8]).style(p.ghost()).on_press(Message::InsertImage).into(),
+                tool(icon(i::TABLE).into(), Action::InsertTable, in_table),
             ]),
         ]
-        .spacing(8)
-        .into()
+        .spacing(8);
+        if in_table {
+            let op = |s: &'static str, op: TableOp| -> Element<'static, Message> {
+                button(label(s)).padding([7, 8]).style(p.ghost()).on_press(Message::Format(Action::Table(op))).into()
+            };
+            bar = bar.push(group(vec![
+                op("+ Row", TableOp::AddRow),
+                op("− Row", TableOp::RemoveRow),
+                op("+ Col", TableOp::AddColumn),
+                op("− Col", TableOp::RemoveColumn),
+            ]));
+        }
+        bar.push(space().width(Fill)).push(btn(Some(i::UPLOAD), "PDF", p.ghost()).on_press(Message::ExportPdf)).into()
     }
 
     fn theme_editor(&self, p: Pal) -> Element<'_, Message> {
@@ -1286,6 +1315,25 @@ mod ui_tests {
         }
         click(&mut app, "Theme");
         assert!(app.show_theme && !app.menu_open);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn table_note() {
+        let root = temp_repo("table");
+        let note = root.join("Work/Tribe/Facilo/Plan");
+        std::fs::write(
+            notes::md_path(&note),
+            "Intro\n\n| Name | Qty | Note |\n|:---|---:|:---:|\n| **apple** | 3 | `fresh` [link](http://x.y) |\n| a much longer cell that has to wrap onto several lines in the editor because it is long | 12 | - |\n\nAfter\n",
+        )
+        .unwrap();
+        let mut app = app(&root);
+        let _ = app.update(Message::Open(note));
+        let n = app.note.as_mut().unwrap();
+        n.editor.focused = true;
+        n.editor.perform(Action::Select { pos: editor::Pos { block: 1, offset: 13 }, extend: false });
+        n.editor.perform(Action::Select { pos: editor::Pos { block: 1, offset: 9 }, extend: true });
+        snap(&app, "table");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
