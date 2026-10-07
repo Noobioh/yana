@@ -3,11 +3,14 @@
 # writes release notes. Prints `version=X.Y.Z` (empty when nothing warrants a
 # release) and `notes=<file>`, ready to append to $GITHUB_OUTPUT.
 #   feat!: / BREAKING CHANGE -> major, feat -> minor, fix/perf -> patch, else none
+# With PREVIEW=<n> it always prints a pre-release, X.Y.Z-preview.<n>, where X.Y.Z
+# is the next release (the next patch when nothing warrants one yet).
 set -eu
 cd "$(dirname "$0")/.."
 NOTES=${1:-dist/release-notes.md}
 
-last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+# preview tags (v1.2.0-preview.7) don't count as releases
+last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' 2>/dev/null || true)
 if [ -n "$last" ]; then
     base=${last#v}
     range="$last..HEAD"
@@ -30,6 +33,9 @@ elif printf '%s\n' "$subjects" | grep -qE '^(fix|perf)(\([^)]*\))?:'; then
     version="$major.$minor.$((patch + 1))"
 else
     version=
+fi
+if [ -n "${PREVIEW:-}" ]; then
+    version="${version:-$major.$minor.$((patch + 1))}-preview.$PREVIEW"
 fi
 
 section() {
