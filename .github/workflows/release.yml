@@ -1,16 +1,44 @@
-# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a release.
+# Every push to main with a feat/fix/perf (or breaking) commit since the last
+# v* tag publishes a release; the version comes from scripts/release-plan.sh.
+# Every push to develop publishes a pre-release, vX.Y.Z-preview.<run number>,
+# where X.Y.Z is the release develop would become.
 # GitHub attaches the source code (zip + tar.gz) to every release automatically.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main, develop]
 
 permissions:
   contents: write
 
+# pushes in quick succession release one after another, never in parallel
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          PREVIEW: ${{ github.ref_name == 'develop' && github.run_number || '' }}
+        run: ./scripts/release-plan.sh dist/release-notes.md | tee -a "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.version != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: dist/release-notes.md
+
   build:
+    needs: plan
+    if: needs.plan.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -22,17 +50,16 @@ jobs:
           - os: ubuntu-22.04
             name: linux-x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tag matches Cargo.toml
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$version"; exit 1; }
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Set version
+        run: sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml && rm Cargo.toml.bak
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -76,13 +103,20 @@ jobs:
           path: Yana-*
 
   release:
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
+    env:
+      TAG: v${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      # creates the tag on the built commit and a full (non-draft) release;
+      # main becomes "Latest", develop is a pre-release that never does
       - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" Yana-* --repo "$GITHUB_REPOSITORY" --title "Yana $GITHUB_REF_NAME" --generate-notes
+        run: >
+          gh release create "$TAG" Yana-*
+          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+          --title "Yana $TAG" --notes-file release-notes.md
+          ${{ github.ref_name == 'develop' && '--prerelease --latest=false' || '--latest' }}
