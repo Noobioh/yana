@@ -126,10 +126,16 @@ impl Editor {
         let mut blocks: Vec<Block> = (a.block..=b.block)
             .map(|i| {
                 let (s, e) = self.selected_range(i).unwrap();
-                Block::new(self.blocks[i].kind.clone(), self.blocks[i].slice(s..e))
+                let blk = &self.blocks[i];
+                match blk.kind {
+                    // across cells or out of the table: whole rows, so it stays a valid table
+                    Kind::Table { .. } if a.block != b.block || blk.text()[s..e].contains([CELL, ROW]) => table_rows(blk, s..e),
+                    Kind::Table { .. } => Block::new(Kind::Paragraph, blk.slice(s..e)),
+                    _ => Block::new(blk.kind.clone(), blk.slice(s..e)),
+                }
             })
             .collect();
-        if blocks.len() == 1 && !matches!(blocks[0].kind, Kind::Image { .. }) {
+        if blocks.len() == 1 && !matches!(blocks[0].kind, Kind::Image { .. } | Kind::Table { .. }) {
             blocks[0].kind = Kind::Paragraph;
         }
         Some(doc::serialize(&blocks).trim_end().to_string())
@@ -329,6 +335,9 @@ impl Editor {
                     blk.delete(s..e);
                 }
             }
+            if self.blocks.is_empty() {
+                self.blocks.push(Block::paragraph());
+            }
             return true;
         }
         if a.block == b.block {
@@ -352,9 +361,6 @@ impl Editor {
 
     fn insert(&mut self, text: &str) {
         self.delete_selection();
-        if self.blocks.is_empty() {
-            self.blocks.push(Block::paragraph());
-        }
         let c = self.cursor;
         if matches!(self.blocks[c.block].kind, Kind::Image { .. }) {
             self.blocks.insert(c.block + 1, Block::paragraph());
@@ -740,9 +746,6 @@ impl Editor {
 
     fn insert_table(&mut self) {
         self.delete_selection();
-        if self.blocks.is_empty() {
-            self.blocks.push(Block::paragraph());
-        }
         let c = self.cursor;
         let table = Block::table(vec![Alignment::None; 3], vec![vec![vec![]; 3]; 2]);
         let b = &mut self.blocks[c.block];
@@ -814,6 +817,16 @@ impl Editor {
 
 fn is_table(b: &Block) -> bool {
     matches!(b.kind, Kind::Table { .. })
+}
+
+/// The header plus every row that `range` touches, as a table of its own.
+fn table_rows(b: &Block, range: Range<usize>) -> Block {
+    let Kind::Table { align } = &b.kind else { return b.clone() };
+    let grid = b.grid();
+    let touched = b.cells().into_iter().enumerate().skip(1).filter(|(_, row)| range.start < row.last().unwrap().end && range.end > row[0].start);
+    let mut rows = vec![grid[0].clone()];
+    rows.extend(touched.map(|(r, _)| grid[r].clone()));
+    Block::table(align.clone(), rows)
 }
 
 /// Delete `range` from a table block, but keep the cell/row separators in it.
@@ -954,6 +967,25 @@ mod tests {
         e.perform(Action::Select { pos: Pos { block: 1, offset: 2 }, extend: true });
         e.perform(Action::Delete);
         assert_eq!(e.markdown(), "| b |  |\n|---|---|\n|  |  |\n\nter\n");
+    }
+
+    #[test]
+    fn table_copy_and_select_all() {
+        let mut e = ed("| a | b |\n|---|---|\n| c | d |\n| e | f |\n");
+        // "a\tb\nc\td\ne\tf": inside one cell copies plain text, across cells whole rows
+        e.perform(Action::Select { pos: Pos { block: 0, offset: 4 }, extend: false });
+        e.perform(Action::Select { pos: Pos { block: 0, offset: 5 }, extend: true });
+        assert_eq!(e.selection_markdown().unwrap(), "c");
+        e.perform(Action::Select { pos: Pos { block: 0, offset: 7 }, extend: true });
+        assert_eq!(e.selection_markdown().unwrap(), "| a | b |\n|---|---|\n| c | d |");
+        // the note is only a table: select all + Enter/paste/image must not panic
+        e.perform(Action::SelectAll);
+        e.perform(Action::Enter);
+        e.perform(Action::SelectAll);
+        e.perform(Action::Paste("x".into()));
+        e.perform(Action::SelectAll);
+        e.perform(Action::InsertImage { src: "a.png".into(), alt: String::new() });
+        assert_eq!(e.markdown(), "![](a.png)\n");
     }
 
     #[test]

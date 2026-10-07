@@ -617,7 +617,9 @@ fn hit(l: &Laid, p: Point) -> usize {
     let row: Vec<&Cell> = l.cells.iter().filter(|c| c.rect.y == row_y).collect();
     let cell = row.iter().find(|c| p.x < c.rect.x + c.rect.width).unwrap_or(row.last().unwrap());
     let o = cell.text_origin();
-    cell.range.start + hit_in(&cell.para, &text[cell.range.clone()], Point::new(p.x - o.x, p.y - o.y))
+    // clicks/probes in the cell padding go to the nearest text line
+    let y = (p.y - o.y).clamp(0.0, (cell.para.min_bounds().height - 1.0).max(0.0));
+    cell.range.start + hit_in(&cell.para, &text[cell.range.clone()], Point::new(p.x - o.x, y))
 }
 
 fn hit_in(para: &Paragraph, text: &str, p: Point) -> usize {
@@ -644,7 +646,14 @@ fn pos_at(laid: &[Laid], p: Point) -> Pos {
 fn vertical(laid: &[Laid], c: Pos, down: bool) -> Pos {
     let Some(l) = laid.get(c.block) else { return c };
     let (x, y, h) = caret(l, c.offset);
-    let ty = if down { y + h + 1.0 } else { y - 1.0 };
+    let mut ty = if down { y + h + 1.0 } else { y - 1.0 };
+    if let Some(cell) = l.cells.iter().find(|cell| c.offset <= cell.range.end) {
+        let top = cell.text_origin().y;
+        if ty < top || ty >= top + cell.para.min_bounds().height {
+            // past the cell's text (into its padding): step to the row above/below
+            ty = if down { cell.rect.y + cell.rect.height + 1.0 } else { cell.rect.y - 1.0 };
+        }
+    }
     let is_image = |l: &Laid| matches!(l.block.kind, Kind::Image { .. });
     if !is_image(l) && ty >= 0.0 && ty < l.height {
         return Pos { offset: hit(l, Point::new(x, ty)), ..c };
@@ -674,4 +683,34 @@ fn open_url(url: &str) {
         "xdg-open"
     };
     let _ = std::process::Command::new(cmd).arg(url).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn laid(b: Block, pal: Pal) -> Laid {
+        let (cells, mut height) = table_cells(&b, pal, 600.0);
+        let para = paragraph(&spans(&b, pal), 600.0, SIZE, text::Wrapping::WordOrGlyph);
+        if cells.is_empty() {
+            height = para.min_bounds().height.max(SIZE * LINE);
+        }
+        Laid { block: b, width: 600.0, pal, para, left: 0.0, top: 0.0, height, image: None, cells }
+    }
+
+    #[test]
+    fn arrows_move_between_table_rows() {
+        let pal = theme::Colors::dark().pal();
+        let laid: Vec<Laid> = crate::doc::parse("above\n\n| a | b |\n|---|---|\n| c | d |\n| e | f |\n\nbelow\n")
+            .into_iter()
+            .map(|b| laid(b, pal))
+            .collect();
+        let at = |offset| Pos { block: 1, offset };
+        // "a\tb\nc\td\ne\tf": b=2, d=6, f=10 (caret after the letter)
+        assert_eq!(vertical(&laid, at(3), true), at(7), "b -> d");
+        assert_eq!(vertical(&laid, at(7), true), at(11), "d -> f");
+        assert_eq!(vertical(&laid, at(11), true).block, 2, "last row -> next block");
+        assert_eq!(vertical(&laid, at(7), false), at(3), "d -> b");
+        assert_eq!(vertical(&laid, at(3), false).block, 0, "header -> previous block");
+    }
 }
