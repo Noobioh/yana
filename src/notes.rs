@@ -72,7 +72,7 @@ fn fresh(path: PathBuf) -> io::Result<PathBuf> {
 pub fn create_note(parent: &Path, name: &str) -> io::Result<PathBuf> {
     let dir = fresh(parent.join(name))?;
     fs::create_dir_all(&dir)?;
-    fs::write(md_path(&dir), format!("# {name}\n"))?;
+    fs::write(md_path(&dir), "")?; // the title is the folder name, shown above the note
     Ok(dir)
 }
 

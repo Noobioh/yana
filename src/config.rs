@@ -20,6 +20,8 @@ pub struct Config {
     pub repos: Vec<Repo>,
     #[serde(default)]
     pub active: usize,
+    #[serde(default)]
+    pub theme: crate::theme::Colors,
 }
 
 fn file() -> PathBuf {

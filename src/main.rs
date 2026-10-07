@@ -4,12 +4,13 @@ mod editor;
 mod git;
 mod notes;
 mod tags;
+mod theme;
 mod widget;
 
 use config::{Config, Repo};
 use doc::Kind;
 use editor::{Action, Editor, Mark};
-use iced::widget::{button, center, column, container, operation, pick_list, row, rule, scrollable, space, text, text_input};
+use iced::widget::{button, center, column, container, mouse_area, opaque, operation, pick_list, row, rule, scrollable, space, stack, svg, text, text_input};
 use iced::{Border, Color, Element, Fill, Subscription, Task, Theme, time, window};
 use tags::{Front, TagsFile};
 use notes::Node;
@@ -19,14 +20,19 @@ use std::time::{Duration, Instant};
 
 const SAVE_AFTER: Duration = Duration::from_millis(1500);
 const DIALOG_INPUT: &str = "dialog-input";
+const ADD_REPO_URL: &str = "add-repo-url";
+const TITLE_INPUT: &str = "title-input";
+const LOGO_ID: &str = "logo";
 
 fn main() -> iced::Result {
-    iced::application(App::boot, App::update, App::view)
-        .title("ez-notes")
+    let app = iced::application(App::boot, App::update, App::view)
+        .title("Yana")
         .subscription(App::subscription)
         .exit_on_close_request(false)
-        .window_size((1200.0, 800.0))
-        .run()
+        .window(window::Settings { size: iced::Size::new(1280.0, 820.0), icon: theme::window_icon(), ..window::Settings::default() })
+        .theme(App::theme)
+        .default_font(theme::SANS);
+    theme::FONTS.into_iter().fold(app, |app, f| app.font(f)).run()
 }
 
 struct OpenNote {
@@ -59,7 +65,6 @@ impl OpenNote {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DialogKind {
-    AddRepo,
     NewNote,
     NewFolder,
     Rename,
@@ -67,6 +72,21 @@ enum DialogKind {
     AddTag,
     /// Change the color of the tag named in the dialog value.
     TagColor,
+}
+
+#[derive(Default)]
+struct AddRepoForm {
+    url: String,
+    /// Optional; derived from the URL when left empty.
+    name: String,
+    busy: bool,
+    error: Option<String>,
+}
+
+/// `git@github.com:me/notes.git` -> `notes`
+fn repo_name_from_url(url: &str) -> String {
+    let name = url.trim().trim_end_matches('/').trim_end_matches(".git").rsplit(['/', ':']).next().unwrap_or("");
+    if name.is_empty() { "notes".into() } else { name.into() }
 }
 
 #[derive(Default)]
@@ -93,6 +113,13 @@ struct App {
     tags: TagsFile,
     /// Color chosen in the tag dialog; None = keep existing (or auto for new tags).
     dialog_color: Option<String>,
+    show_theme: bool,
+    /// App menu under the logo.
+    menu_open: bool,
+    /// "Add repository" modal, when open.
+    add_repo: Option<AddRepoForm>,
+    /// Inline rename of the open note via its title.
+    title_edit: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +148,19 @@ enum Message {
     RemoveTag(String),
     EditTag(String),
     PickColor(String),
+    ToggleTheme,
+    ToggleMenu,
+    AddRepoOpen,
+    AddRepoUrl(String),
+    AddRepoName(String),
+    AddRepoSubmit,
+    AddRepoCancel,
+    EditTitle,
+    TitleInput(String),
+    TitleSubmit,
+    TitleCancel,
+    ThemeColor(&'static str, String),
+    ThemePreset(theme::Colors),
 }
 
 impl App {
@@ -193,6 +233,7 @@ impl App {
         match OpenNote::load(dir.clone()) {
             Ok(note) => {
                 self.note = Some(note);
+                self.title_edit = None;
                 self.selected = Some(dir);
             }
             Err(e) => self.fail(e),
@@ -353,6 +394,8 @@ impl App {
                 return Task::batch([save, pull]);
             }
             Message::Cloned(Ok(repo)) => {
+                self.add_repo = None;
+                self.sync = Sync::Idle;
                 self.config.repos.push(repo);
                 self.config.active = self.config.repos.len() - 1;
                 if let Err(e) = self.config.save() {
@@ -362,9 +405,56 @@ impl App {
                 self.selected = None;
                 return self.open_repo();
             }
-            Message::Cloned(Err(e)) => {
-                self.sync = Sync::Idle;
-                self.fail(e);
+            Message::Cloned(Err(e)) => match self.add_repo.as_mut() {
+                Some(form) => {
+                    form.busy = false;
+                    form.error = Some(e);
+                }
+                None => self.fail(e),
+            },
+            Message::AddRepoOpen => {
+                self.menu_open = false;
+                self.add_repo = Some(AddRepoForm::default());
+                return operation::focus(ADD_REPO_URL);
+            }
+            Message::AddRepoUrl(v) | Message::AddRepoName(v) if self.add_repo.as_ref().is_some_and(|f| f.busy) => drop(v),
+            Message::AddRepoUrl(v) => {
+                if let Some(f) = self.add_repo.as_mut() {
+                    f.url = v;
+                    f.error = None;
+                }
+            }
+            Message::AddRepoName(v) => {
+                if let Some(f) = self.add_repo.as_mut() {
+                    f.name = v;
+                    f.error = None;
+                }
+            }
+            Message::AddRepoCancel => {
+                if !self.add_repo.as_ref().is_some_and(|f| f.busy) {
+                    self.add_repo = None;
+                }
+            }
+            Message::AddRepoSubmit => return self.clone_repo(),
+            Message::EditTitle => {
+                let Some(n) = &self.note else { return Task::none() };
+                self.title_edit = Some(n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                return operation::focus(TITLE_INPUT);
+            }
+            Message::TitleInput(v) => {
+                if let Some(t) = self.title_edit.as_mut() {
+                    *t = v;
+                }
+            }
+            Message::TitleCancel => self.title_edit = None,
+            Message::TitleSubmit => {
+                let (Some(value), Some(n)) = (self.title_edit.take(), &self.note) else { return Task::none() };
+                if n.dir.file_name().is_some_and(|f| f.to_string_lossy() == value.trim()) {
+                    return Task::none();
+                }
+                // same path as the sidebar Rename: renames folder + .md, reopens, commits
+                self.selected = Some(n.dir.clone());
+                return self.submit(DialogKind::Rename, value);
             }
             Message::Pulled(r) => {
                 if !self.git_busy {
@@ -422,8 +512,125 @@ impl App {
                 self.dialog = Some((DialogKind::TagColor, tag));
             }
             Message::PickColor(c) => self.dialog_color = Some(c),
+            Message::ToggleTheme => {
+                self.show_theme = !self.show_theme;
+                self.menu_open = false;
+            }
+            Message::ToggleMenu => self.menu_open = !self.menu_open,
+            Message::ThemeColor(key, value) => {
+                if let Some(field) = self.config.theme.get_mut(key) {
+                    *field = value;
+                }
+                if let Err(e) = self.config.save() {
+                    self.fail(e);
+                }
+            }
+            Message::ThemePreset(colors) => {
+                self.config.theme = colors;
+                if let Err(e) = self.config.save() {
+                    self.fail(e);
+                }
+            }
         }
         Task::none()
+    }
+
+    fn clone_repo(&mut self) -> Task<Message> {
+        let Some(form) = self.add_repo.as_mut().filter(|f| !f.busy) else { return Task::none() };
+        let url = form.url.trim().to_string();
+        if url.is_empty() {
+            form.error = Some("Enter the repository URL.".into());
+            return Task::none();
+        }
+        let wanted = if form.name.trim().is_empty() { repo_name_from_url(&url) } else { form.name.clone() };
+        let name = match notes::valid_name(&wanted) {
+            Ok(n) => n.to_string(),
+            Err(e) => {
+                form.error = Some(e);
+                return Task::none();
+            }
+        };
+        if self.config.repos.iter().any(|r| r.url == url) {
+            form.error = Some("This repository is already added.".into());
+            return Task::none();
+        }
+        let mut path = config::clones_dir().join(&name);
+        let mut i = 1;
+        while path.exists() {
+            path = config::clones_dir().join(format!("{name}-{i}"));
+            i += 1;
+        }
+        form.busy = true;
+        form.error = None;
+        self.sync = Sync::Busy;
+        let repo = Repo { name: path.file_name().unwrap().to_string_lossy().into_owned(), url, path };
+        Task::perform(async move { git::clone(&repo.url, &repo.path).map(|_| repo) }, Message::Cloned)
+    }
+
+    fn add_repo_modal<'a>(&'a self, form: &'a AddRepoForm, p: Pal) -> Element<'a, Message> {
+        let derived = repo_name_from_url(&form.url);
+        let name = if form.name.trim().is_empty() { derived.clone() } else { form.name.trim().to_string() };
+        let field = |label: &'static str| text(label).size(13).font(weight(Medium)).color(p.muted);
+        let mut card = column![
+            row![
+                container(icon(i::BOOK).color(theme::on(p.signal))).padding(8).style(p.fill(p.signal, 8.0)),
+                text("Add repository").size(22).font(weight(Semibold)),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+            text("Clone a git repository to keep your notes in. Private repositories work with your existing SSH keys or git credential helper.")
+                .size(14)
+                .color(p.muted),
+            column![
+                field("Repository URL"),
+                text_input("git@github.com:you/notes.git", &form.url)
+                    .id(ADD_REPO_URL)
+                    .on_input(Message::AddRepoUrl)
+                    .on_submit(Message::AddRepoSubmit)
+                    .font(theme::MONO)
+                    .size(13)
+                    .padding([10, 12])
+                    .style(p.input()),
+            ]
+            .spacing(6),
+            column![
+                field("Name (optional)"),
+                text_input(&derived, &form.name)
+                    .on_input(Message::AddRepoName)
+                    .on_submit(Message::AddRepoSubmit)
+                    .size(14)
+                    .padding([10, 12])
+                    .style(p.input()),
+                text(format!("Cloned to {}", config::clones_dir().join(name).display())).font(theme::MONO).size(11).color(p.faint),
+            ]
+            .spacing(6),
+        ]
+        .spacing(18);
+        if let Some(e) = &form.error {
+            card = card.push(
+                container(row![icon(i::ALERT).color(p.danger), text(e.as_str()).size(13).color(p.danger).width(Fill)].spacing(8))
+                    .padding([8, 10])
+                    .style(p.fill(theme::alpha(p.danger, 0.1), 8.0)),
+            );
+        }
+        let ready = !form.busy && !form.url.trim().is_empty();
+        card = card.push(
+            row![
+                space::horizontal(),
+                btn(None, "Cancel", p.ghost()).on_press_maybe((!form.busy).then_some(Message::AddRepoCancel)),
+                btn(Some(i::REFRESH), if form.busy { "Cloning…" } else { "Clone" }, p.primary())
+                    .on_press_maybe(ready.then_some(Message::AddRepoSubmit)),
+            ]
+            .spacing(8),
+        );
+        container(card)
+            .width(500)
+            .padding(24)
+            .style(move |t: &Theme| container::Style {
+                shadow: iced::Shadow { color: theme::alpha(Color::BLACK, 0.5), offset: iced::Vector::new(0.0, 12.0), blur_radius: 40.0 },
+                ..p.panel()(t)
+            })
+            .into()
     }
 
     fn submit(&mut self, kind: DialogKind, value: String) -> Task<Message> {
@@ -452,19 +659,6 @@ impl App {
                 }
             }
             return Task::none();
-        }
-        if kind == DialogKind::AddRepo {
-            let url = value.trim().to_string();
-            let name = url.trim_end_matches('/').trim_end_matches(".git").rsplit(['/', ':']).next().unwrap_or("notes").to_string();
-            let mut path = config::clones_dir().join(&name);
-            let mut i = 1;
-            while path.exists() {
-                path = config::clones_dir().join(format!("{name}-{i}"));
-                i += 1;
-            }
-            let repo = Repo { name: path.file_name().unwrap().to_string_lossy().into_owned(), url, path };
-            self.sync = Sync::Busy;
-            return Task::perform(async move { git::clone(&repo.url, &repo.path).map(|_| repo) }, Message::Cloned);
         }
         let name = match notes::valid_name(&value) {
             Ok(n) => n.to_string(),
@@ -504,7 +698,7 @@ impl App {
                     }
                 }
             }
-            DialogKind::AddRepo | DialogKind::Link | DialogKind::AddTag | DialogKind::TagColor => unreachable!(),
+            DialogKind::Link | DialogKind::AddTag | DialogKind::TagColor => unreachable!(),
         };
         match result {
             Ok((open, msg)) => {
@@ -529,197 +723,442 @@ impl App {
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let status = match &self.sync {
-            Sync::Idle if self.note.as_ref().is_some_and(OpenNote::dirty) => text("● unsaved"),
-            Sync::Idle => text("✓ synced"),
-            Sync::Busy => text("↻ syncing…"),
-            Sync::Error(e) => text(format!("⚠ {e}")),
-        };
-        let has_repo = self.config.active().is_some();
-        let top = row![
-            pick_list(&self.config.repos[..], self.config.active(), Message::SelectRepo).placeholder("No repository"),
-            button("+ Repo").on_press(Message::Dialog(DialogKind::AddRepo)),
-            button("Remove repo").on_press_maybe(has_repo.then_some(Message::RemoveRepo)),
-            space::horizontal(),
-            container(status).max_width(500),
-            button("Sync").on_press_maybe(has_repo.then_some(Message::SyncNow)),
-            button("Export…").on_press_maybe(has_repo.then_some(Message::Export)),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
 
-        let selected = self.selected.is_some();
-        let sidebar = column![
-            row![
-                button("+ Note").on_press_maybe(has_repo.then_some(Message::Dialog(DialogKind::NewNote))),
-                button("+ Folder").on_press_maybe(has_repo.then_some(Message::Dialog(DialogKind::NewFolder))),
-            ]
-            .spacing(4),
-            row![
-                button("Rename").on_press_maybe(selected.then_some(Message::Dialog(DialogKind::Rename))),
-                button("Delete").on_press_maybe(selected.then_some(Message::Delete)),
-            ]
-            .spacing(4),
-            rule::horizontal(1),
-            scrollable(column(self.tree_view(&self.tree, 0)).spacing(2)).height(Fill),
-        ]
-        .spacing(8)
-        .width(260);
-
-        let mut main = column![].spacing(8);
-        if let Some(e) = &self.error {
-            main = main.push(row![text(format!("⚠ {e}")).width(Fill), button("×").on_press(Message::DismissError)].spacing(8));
-        }
-        if let Some((kind, value)) = &self.dialog {
-            let (label, placeholder) = match kind {
-                DialogKind::AddRepo => ("Clone repository", "git@github.com:you/notes.git"),
-                DialogKind::NewNote => ("New note", "Note name"),
-                DialogKind::NewFolder => ("New folder", "Folder name"),
-                DialogKind::Rename => ("Rename", "New name"),
-                DialogKind::Link => ("Link URL", "https://… (empty removes the link)"),
-                DialogKind::AddTag => ("Add tag", "tag name"),
-                DialogKind::TagColor => ("Color for", ""),
-            };
-            let input: Element<'_, Message> = if *kind == DialogKind::TagColor {
-                text(value.clone()).into()
-            } else {
-                text_input(placeholder, value)
-                    .id(DIALOG_INPUT)
-                    .on_input(Message::DialogInput)
-                    .on_submit(Message::DialogSubmit)
-                    .into()
-            };
-            let mut dialog = row![text(label), input].spacing(8).align_y(iced::Center);
-            if matches!(kind, DialogKind::AddTag | DialogKind::TagColor) {
-                dialog = dialog.push(self.swatches(value));
-            }
-            main = main.push(dialog.extend([
-                button("OK").on_press(Message::DialogSubmit).into(),
-                button("Cancel").on_press(Message::DialogCancel).into(),
-            ]));
-        }
-        let body: Element<'_, Message> = match &self.note {
-            Some(n) => column![
-                self.tag_bar(n),
-                self.toolbar(),
-                rule::horizontal(1),
-                scrollable(container(widget::view(&n.editor, &n.dir, Message::Editor)).padding([16, 32])).height(Fill),
-            ]
-            .spacing(8)
-            .into(),
-            None if !has_repo => center(text("Add a git repository to start (+ Repo)")).into(),
-            None => center(text("Select or create a note")).into(),
-        };
-        main = main.push(body);
-
-        column![top, rule::horizontal(1), row![sidebar, rule::vertical(1), main.width(Fill)].spacing(12)]
-            .spacing(8)
-            .padding(12)
-            .into()
+    fn theme(&self) -> Theme {
+        self.config.theme.pal().theme()
     }
 
-    fn tag_bar<'a>(&'a self, n: &'a OpenNote) -> Element<'a, Message> {
+    fn view(&self) -> Element<'_, Message> {
+        let p = self.config.theme.pal();
+        let has_repo = self.config.active().is_some();
+
+        // ---- top bar
+        let logo = container(svg(theme::logo(&p, false)).width(36).height(36)).id(LOGO_ID);
+        let logo = button(logo).padding(0).style(p.bare(p.text)).on_press(Message::ToggleMenu);
+        let repo = container(
+            row![
+                icon(i::BOOK).color(p.muted),
+                pick_list(&self.config.repos[..], self.config.active(), Message::SelectRepo)
+                    .placeholder("No repository")
+                    .font(theme::MONO)
+                    .text_size(13)
+                    .padding([4, 4])
+                    .style(p.pick())
+                    .menu_style(p.menu()),
+            ]
+            .spacing(6)
+            .align_y(iced::Center),
+        )
+        .padding([4, 10])
+        .style(p.group());
+        let (status_icon, status_color, status) = match &self.sync {
+            Sync::Error(e) => (i::ALERT, p.danger, e.lines().last().unwrap_or("error").to_string()),
+            Sync::Busy => (i::REFRESH, p.muted, "syncing…".into()),
+            Sync::Idle if self.note.as_ref().is_some_and(OpenNote::dirty) => (i::PENCIL, p.faint, "unsaved".into()),
+            Sync::Idle => (i::CHECK, p.signal, "synced".into()),
+        };
+        let status = row![
+            icon(status_icon).size(14).color(status_color),
+            text(status).font(theme::MONO).size(12).color(if matches!(self.sync, Sync::Error(_)) { p.danger } else { p.muted }),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+        let top = container(
+            row![
+                logo,
+                repo,
+                btn(Some(i::PLUS), "Add repo", p.ghost()).on_press(Message::AddRepoOpen),
+                btn(Some(i::MINUS), "Remove repo", p.ghost_with(p.muted, false)).on_press_maybe(has_repo.then_some(Message::RemoveRepo)),
+                space::horizontal(),
+                container(status).max_width(420),
+                btn(Some(i::REFRESH), "Sync", p.primary()).on_press_maybe(has_repo.then_some(Message::SyncNow)),
+                btn(Some(i::UPLOAD), "Export…", p.secondary()).on_press_maybe(has_repo.then_some(Message::Export)),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .padding(12)
+        .style(p.panel());
+
+        // ---- sidebar
+        let full = |b: button::Button<'static, Message>| b.width(Fill);
+        let selected_name = self
+            .selected
+            .as_ref()
+            .and_then(|s| s.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let selected = self.selected.is_some();
+        let sidebar = container(
+            column![
+                row![
+                    full(btn(Some(i::FILE_PLUS), "Note", p.secondary()))
+                        .on_press_maybe(has_repo.then_some(Message::Dialog(DialogKind::NewNote))),
+                    full(btn(Some(i::FOLDER_PLUS), "Folder", p.secondary()))
+                        .on_press_maybe(has_repo.then_some(Message::Dialog(DialogKind::NewFolder))),
+                ]
+                .spacing(8)
+                .padding(12),
+                rule::horizontal(1).style(p.rule()),
+                scrollable(column(self.tree_view(&self.tree, p)).spacing(2).padding(12)).height(Fill),
+                rule::horizontal(1).style(p.rule()),
+                row![
+                    text(selected_name).size(13).color(p.muted).width(Fill).wrapping(text::Wrapping::None),
+                    btn(Some(i::PENCIL), "Rename", p.ghost()).on_press_maybe(selected.then_some(Message::Dialog(DialogKind::Rename))),
+                    btn(Some(i::TRASH), "Delete", p.danger()).on_press_maybe(selected.then_some(Message::Delete)),
+                ]
+                .spacing(4)
+                .padding([8, 12])
+                .align_y(iced::Center),
+            ],
+        )
+        .width(300)
+        .height(Fill)
+        .style(p.panel());
+
+        // ---- main panel
+        let mut main = column![];
+        if let Some(e) = &self.error {
+            main = main.push(
+                container(
+                    row![
+                        icon(i::ALERT).color(p.danger),
+                        text(e.as_str()).size(13).color(p.danger).width(Fill),
+                        button(icon(i::X).color(p.muted)).style(p.ghost()).on_press(Message::DismissError),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                )
+                .padding([8, 12]),
+            );
+            main = main.push(rule::horizontal(1).style(p.rule()));
+        }
+        if let Some(dialog) = self.dialog_bar(p) {
+            main = main.push(dialog).push(rule::horizontal(1).style(p.rule()));
+        }
+        let body: Element<'_, Message> = match &self.note {
+            _ if self.show_theme => scrollable(container(self.theme_editor(p)).padding([24, 32]).max_width(760)).height(Fill).into(),
+            Some(n) => {
+                let rel = self.repo_dir().and_then(|r| n.dir.parent()?.strip_prefix(r).ok().map(Path::to_path_buf));
+                let crumbs = rel
+                    .map(|r| r.iter().map(|c| c.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" / "))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.config.active().map(|r| r.name.clone()))
+                    .unwrap_or_default();
+                let title = n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let page = column![
+                    text(crumbs).font(theme::MONO).size(12).color(p.faint),
+                    self.title(title, p),
+                    self.tag_bar(n, p),
+                    rule::horizontal(1).style(p.rule()),
+                    widget::view(&n.editor, &n.dir, p, Message::Editor),
+                ]
+                .spacing(14)
+                .max_width(760);
+                column![
+                    container(self.toolbar(n, p)).padding(12),
+                    rule::horizontal(1).style(p.rule()),
+                    scrollable(container(page).center_x(Fill).padding([24, 32])).height(Fill),
+                ]
+                .into()
+            }
+            None => center(
+                column![
+                    svg(theme::logo(&p, false)).width(64).height(64),
+                    text("Yana").size(36).font(weight(Semibold)),
+                    text(if has_repo { "Select or create a note" } else { "Add a git repository to start" }).color(p.muted),
+                ]
+                .spacing(12)
+                .align_x(iced::Center),
+            )
+            .into(),
+        };
+        let main = container(main.push(body)).width(Fill).height(Fill).style(p.panel());
+
+        let base = container(column![top, row![sidebar, main].spacing(12)].spacing(12).padding(12))
+            .width(Fill)
+            .height(Fill)
+            .style(p.ground());
+        let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
+        if self.menu_open {
+            // dropdown under the logo; clicking anywhere else closes it
+        let item = row![icon(i::PALETTE), text("Theme").size(14).font(weight(Medium))].spacing(8).align_y(iced::Center);
+        let menu = container(button(item).width(Fill).padding([9, 12]).style(p.ghost_with(p.text, self.show_theme)).on_press(Message::ToggleTheme))
+            .width(200)
+            .padding(4)
+            .style(move |t: &Theme| container::Style {
+                shadow: iced::Shadow { color: theme::alpha(Color::BLACK, 0.4), offset: iced::Vector::new(0.0, 6.0), blur_radius: 18.0 },
+                ..p.panel()(t)
+            });
+            layers.push(mouse_area(space().width(Fill).height(Fill)).on_press(Message::ToggleMenu).into());
+            layers.push(container(menu).padding(iced::Padding::ZERO.top(68.0).left(24.0)).into());
+        }
+        if let Some(form) = &self.add_repo {
+            // modal: dimmed backdrop (click = cancel), card swallows its own clicks
+            let backdrop = container(space().width(Fill).height(Fill)).style(p.fill(theme::alpha(Color::BLACK, 0.55), 0.0));
+            layers.push(mouse_area(backdrop).on_press(Message::AddRepoCancel).into());
+            layers.push(center(opaque(self.add_repo_modal(form, p))).into());
+        }
+        stack(layers).into()
+    }
+
+    /// Note title; click to rename in place.
+    fn title(&self, title: String, p: Pal) -> Element<'_, Message> {
+        match &self.title_edit {
+            Some(value) => row![
+                text_input("Note name", value)
+                    .id(TITLE_INPUT)
+                    .on_input(Message::TitleInput)
+                    .on_submit(Message::TitleSubmit)
+                    .size(36)
+                    .font(weight(Semibold))
+                    .padding([0, 6])
+                    .style(p.input()),
+                btn(Some(i::CHECK), "Rename", p.primary()).on_press(Message::TitleSubmit),
+                button(icon(i::X).color(p.muted)).padding(10).style(p.ghost()).on_press(Message::TitleCancel),
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+            .into(),
+            None => button(text(title).size(36).font(weight(Semibold)))
+                .padding([0, 6])
+                .style(p.row(false))
+                .on_press(Message::EditTitle)
+                .into(),
+        }
+    }
+
+    fn dialog_bar(&self, p: Pal) -> Option<Element<'_, Message>> {
+        let (kind, value) = self.dialog.as_ref()?;
+        let (label, placeholder) = match kind {
+            DialogKind::NewNote => ("New note", "Note name"),
+            DialogKind::NewFolder => ("New folder", "Folder name"),
+            DialogKind::Rename => ("Rename", "New name"),
+            DialogKind::Link => ("Link URL", "https://… (empty removes the link)"),
+            DialogKind::AddTag => ("Add tag", "tag name"),
+            DialogKind::TagColor => ("Color for", ""),
+        };
+        let input: Element<'_, Message> = if *kind == DialogKind::TagColor {
+            text(value.clone()).font(theme::MONO).size(13).into()
+        } else {
+            text_input(placeholder, value)
+                .id(DIALOG_INPUT)
+                .on_input(Message::DialogInput)
+                .on_submit(Message::DialogSubmit)
+                .padding([8, 10])
+                .size(14)
+                .style(p.input())
+                .into()
+        };
+        let mut bar = row![text(label).size(14).color(p.muted), input].spacing(10).align_y(iced::Center);
+        if matches!(kind, DialogKind::AddTag | DialogKind::TagColor) {
+            bar = bar.push(self.swatches(value, p));
+        }
+        let bar = bar
+            .push(btn(None, "OK", p.primary()).on_press(Message::DialogSubmit))
+            .push(btn(None, "Cancel", p.ghost()).on_press(Message::DialogCancel));
+        Some(container(bar).padding(12).into())
+    }
+
+    fn tag_bar<'a>(&'a self, n: &'a OpenNote, p: Pal) -> Element<'a, Message> {
         let chips = n.front.tags.iter().map(|t| {
-            let bg = self.tags.color(t);
-            let fg = if bg.relative_luminance() > 0.5 { Color::BLACK } else { Color::WHITE };
-            let plain = move |_: &Theme, _| button::Style { text_color: fg, ..button::Style::default() };
             container(
                 row![
-                    button(text(t.as_str()).size(13)).padding(0).style(plain).on_press(Message::EditTag(t.clone())),
-                    button(text("×").size(13)).padding(0).style(plain).on_press(Message::RemoveTag(t.clone())),
+                    dot(self.tags.color(t), 6.0),
+                    button(text(t.as_str()).font(theme::MONO).size(12)).padding(0).style(p.bare(p.text)).on_press(Message::EditTag(t.clone())),
+                    button(icon(i::X).size(12)).padding(0).style(p.bare(p.faint)).on_press(Message::RemoveTag(t.clone())),
                 ]
-                .spacing(6),
+                .spacing(8)
+                .align_y(iced::Center),
             )
-            .padding([2, 10])
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                border: Border { radius: 10.0.into(), ..Border::default() },
-                ..container::Style::default()
-            })
+            .padding([4, 8])
+            .style(p.group())
             .into()
         });
-        row(chips)
-            .push(button(text("+ Tag").size(13)).padding([2, 10]).style(button::secondary).on_press(Message::Dialog(DialogKind::AddTag)))
-            .spacing(6)
-            .align_y(iced::Center)
-            .into()
+        let add = button(row![icon(i::PLUS).size(12), text("Tag").font(theme::MONO).size(12)].spacing(4).align_y(iced::Center))
+            .padding([4, 8])
+            .style(move |t: &Theme, s| button::Style { border: Border { color: theme::alpha(p.tag, 0.5), width: 1.0, radius: 6.0.into() }, ..p.bare(p.tag)(t, s) })
+            .on_press(Message::Dialog(DialogKind::AddTag));
+        row(chips).push(add).spacing(8).align_y(iced::Center).into()
     }
 
     /// "Auto" plus the fixed palette; the current choice gets an outline.
-    fn swatches(&self, tag: &str) -> Element<'_, Message> {
+    fn swatches(&self, tag: &str, p: Pal) -> Element<'_, Message> {
         let current = self.dialog_color.clone().unwrap_or_else(|| self.tags.setting(tag.trim()).to_string());
-        let ring = |selected: bool| Border { radius: 11.0.into(), width: if selected { 3.0 } else { 0.0 }, color: Color::BLACK };
-        let auto_color = tags::hex_color(tags::auto(tag.trim())).unwrap();
-        let auto_selected = current == tags::AUTO;
+        let auto = tags::hex_color(tags::auto(tag.trim())).unwrap();
         let auto = button(text("Auto").size(12))
-            .padding([3, 8])
-            .style(move |_, _| button::Style {
-                background: Some(auto_color.into()),
-                text_color: Color::WHITE,
-                border: ring(auto_selected),
-                ..button::Style::default()
-            })
+            .padding([4, 8])
+            .style(p.swatch(auto, current == tags::AUTO))
             .on_press(Message::PickColor(tags::AUTO.into()));
         let colors = tags::PALETTE.iter().map(|hex| {
-            let c = tags::hex_color(hex).unwrap();
-            let selected = current == *hex;
-            button(space().width(22).height(22))
+            button(space().width(20).height(20))
                 .padding(0)
-                .style(move |_, _| button::Style { background: Some(c.into()), border: ring(selected), ..button::Style::default() })
+                .style(p.swatch(tags::hex_color(hex).unwrap(), current == *hex))
                 .on_press(Message::PickColor(hex.to_string()))
                 .into()
         });
         row![auto].extend(colors).spacing(4).align_y(iced::Center).into()
     }
 
-    fn toolbar(&self) -> Element<'_, Message> {
-        let b = |label: &'static str, action: Action| button(text(label)).on_press(Message::Format(action));
+    fn toolbar(&self, n: &OpenNote, p: Pal) -> Element<'_, Message> {
+        let kind = &n.editor.blocks[n.editor.cursor.block].kind;
+        let tool = |content: Element<'static, Message>, action: Action, active: bool| -> Element<'static, Message> {
+            button(container(content).center_x(18)).padding([7, 8]).style(p.ghost_with(p.text, active)).on_press(Message::Format(action)).into()
+        };
+        let label = |s: &'static str| -> Element<'static, Message> { text(s).size(13).font(weight(Medium)).line_height(1.0).into() };
+        let group = |items: Vec<Element<'static, Message>>| container(row(items).spacing(2)).padding(2).style(p.group());
+        let heading = |n: u8| tool(label(["H1", "H2", "H3"][n as usize - 1]), Action::SetKind(Kind::Heading(n)), *kind == Kind::Heading(n));
+        let list = |ordered: bool| matches!(kind, Kind::List { ordered: o, .. } if *o == ordered);
         row![
-            b("B", Action::Toggle(Mark::Bold)),
-            b("I", Action::Toggle(Mark::Italic)),
-            b("H1", Action::SetKind(Kind::Heading(1))),
-            b("H2", Action::SetKind(Kind::Heading(2))),
-            b("H3", Action::SetKind(Kind::Heading(3))),
-            b("¶", Action::SetKind(Kind::Paragraph)),
-            b("• List", Action::SetKind(Kind::List { ordered: false, depth: 0 })),
-            b("1. List", Action::SetKind(Kind::List { ordered: true, depth: 0 })),
-            b("Code", Action::SetKind(Kind::Code { lang: String::new() })),
-            b("Link", Action::RequestLink),
-            button("Image").on_press(Message::InsertImage),
+            group(vec![
+                tool(text("B").size(13).font(weight(Semibold)).line_height(1.0).into(), Action::Toggle(Mark::Bold), false),
+                tool(text("I").size(13).font(iced::Font { style: iced::font::Style::Italic, ..theme::SANS }).line_height(1.0).into(), Action::Toggle(Mark::Italic), false),
+            ]),
+            group(vec![
+                heading(1),
+                heading(2),
+                heading(3),
+                tool(label("¶"), Action::SetKind(Kind::Paragraph), *kind == Kind::Paragraph),
+            ]),
+            group(vec![
+                tool(icon(i::LIST).into(), Action::SetKind(Kind::List { ordered: false, depth: 0 }), list(false)),
+                tool(icon(i::LIST_ORDERED).into(), Action::SetKind(Kind::List { ordered: true, depth: 0 }), list(true)),
+                tool(icon(i::CODE).into(), Action::SetKind(Kind::Code { lang: String::new() }), matches!(kind, Kind::Code { .. })),
+            ]),
+            group(vec![
+                tool(icon(i::LINK).into(), Action::RequestLink, false),
+                button(container(icon(i::IMAGE)).center_x(18)).padding([7, 8]).style(p.ghost()).on_press(Message::InsertImage).into(),
+            ]),
         ]
-        .spacing(4)
+        .spacing(8)
         .into()
     }
 
-    fn tree_view<'a>(&'a self, nodes: &'a [Node], depth: usize) -> Vec<Element<'a, Message>> {
+    fn theme_editor(&self, p: Pal) -> Element<'_, Message> {
+        let colors = &self.config.theme;
+        let rows = theme::FIELDS.iter().map(|&(key, label)| {
+            let value = colors.get(key);
+            let valid = tags::hex_color(value.trim()).is_some();
+            let swatch = tags::hex_color(value.trim()).unwrap_or(Color::TRANSPARENT);
+            row![
+                container(space().width(28).height(28)).style(move |_: &Theme| container::Style {
+                    background: Some(swatch.into()),
+                    border: Border { color: p.line, width: 1.0, radius: 6.0.into() },
+                    ..container::Style::default()
+                }),
+                text(label).size(14).width(170),
+                text_input("#RRGGBB", value)
+                    .on_input(move |v| Message::ThemeColor(key, v))
+                    .font(theme::MONO)
+                    .size(13)
+                    .padding([6, 10])
+                    .width(130)
+                    .style(p.input()),
+                text(if valid { "" } else { "not a #RRGGBB color" }).size(12).color(p.danger),
+            ]
+            .spacing(12)
+            .align_y(iced::Center)
+            .into()
+        });
+        column![
+            text("Theme").size(36).font(weight(Semibold)),
+            text("Changes apply right away and are saved in your ez-notes config.").size(14).color(p.muted),
+            row![
+                btn(None, "Dark preset", p.secondary()).on_press(Message::ThemePreset(theme::Colors::dark())),
+                btn(None, "Light preset", p.secondary()).on_press(Message::ThemePreset(theme::Colors::light())),
+                space::horizontal(),
+                btn(None, "Done", p.primary()).on_press(Message::ToggleTheme),
+            ]
+            .spacing(8),
+            rule::horizontal(1).style(p.rule()),
+            column(rows).spacing(10),
+        ]
+        .spacing(16)
+        .into()
+    }
+
+    fn tree_view<'a>(&'a self, nodes: &'a [Node], p: Pal) -> Vec<Element<'a, Message>> {
         let mut out = vec![];
         for node in nodes {
-            let (path, label, msg) = match node {
-                Node::Folder { path, name, .. } => {
-                    let arrow = if self.expanded.contains(path) { "▾" } else { "▸" };
-                    (path, format!("{arrow} {name}"), Message::Toggle(path.clone()))
+            let selected = self.selected.as_ref().is_some_and(|s| s == node_path(node));
+            let content: Element<'a, Message> = match node {
+                Node::Folder { path, name, children } => {
+                    let open = self.expanded.contains(path);
+                    row![
+                        icon(if open { i::CHEVRON_DOWN } else { i::CHEVRON_RIGHT }).size(14).color(p.muted),
+                        text(name.as_str()).size(14).font(weight(Medium)).width(Fill).wrapping(text::Wrapping::None),
+                        text(count_notes(children).to_string()).font(theme::MONO).size(12).color(p.faint),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center)
+                    .into()
                 }
-                Node::Note { path, name, .. } => (path, format!("  {name}"), Message::Open(path.clone())),
+                Node::Note { name, tags, .. } => row![
+                    dot(if selected { p.signal } else { p.faint }, 6.0),
+                    text(name.as_str())
+                        .size(14)
+                        .font(weight(if selected { Semibold } else { iced::font::Weight::Normal }))
+                        .width(Fill)
+                        .wrapping(text::Wrapping::None),
+                ]
+                .extend(tags.iter().map(|t| dot(self.tags.color(t), 6.0)))
+                .spacing(8)
+                .align_y(iced::Center)
+                .into(),
             };
-            let style = if self.selected.as_ref() == Some(path) { button::primary } else { button::text };
-            let mut content = row![text(label)].spacing(4).align_y(iced::Center);
-            if let Node::Note { tags, .. } = node {
-                content = content.extend(tags.iter().map(|t| dot(self.tags.color(t), 8.0)));
-            }
-            out.push(
-                container(button(content).style(style).width(Fill).on_press(msg))
-                    .padding(iced::Padding::ZERO.left(depth as f32 * 14.0))
-                    .into(),
-            );
+            let msg = match node {
+                Node::Folder { path, .. } => Message::Toggle(path.clone()),
+                Node::Note { path, .. } => Message::Open(path.clone()),
+            };
+            out.push(button(content).padding([7, 8]).width(Fill).style(p.row(selected)).on_press(msg).into());
             if let Node::Folder { path, children, .. } = node {
-                if self.expanded.contains(path) {
-                    out.extend(self.tree_view(children, depth + 1));
+                if self.expanded.contains(path) && !children.is_empty() {
+                    // nested level: 16 px indent with a 1 px rail in Line color. The rail is
+                    // a 1 px strip of line-colored background, not a vertical rule: a rule is
+                    // Fill-height, which makes nested rows collapse inside the scrollable.
+                    let children = container(column(self.tree_view(children, p)).spacing(2))
+                        .padding(iced::Padding::ZERO.left(6.0))
+                        .style(p.fill(p.panel, 0.0));
+                    let rail = container(children).padding(iced::Padding::ZERO.left(1.0)).style(p.fill(p.line, 0.0));
+                    out.push(container(rail).padding(iced::Padding::ZERO.left(14.0)).into());
                 }
             }
         }
         out
     }
+}
+
+use iced::font::Weight::{Medium, Semibold};
+use theme::{Pal, i, icon, weight};
+
+/// Button per the style sheet: 36 px high, 14 px Medium label, optional icon.
+fn btn<'a>(
+    glyph: Option<char>,
+    label: &'a str,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+) -> button::Button<'a, Message> {
+    let mut content = row![].spacing(8).align_y(iced::Center);
+    if let Some(g) = glyph {
+        content = content.push(icon(g));
+    }
+    content = content.push(text(label).size(14).font(weight(Medium)));
+    button(container(content).center_x(iced::Shrink)).padding([9, 14]).style(style)
+}
+
+fn node_path(n: &Node) -> &PathBuf {
+    match n {
+        Node::Folder { path, .. } | Node::Note { path, .. } => path,
+    }
+}
+
+fn count_notes(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::Folder { children, .. } => count_notes(children),
+            Node::Note { .. } => 1,
+        })
+        .sum()
 }
 
 fn dot<'a>(color: Color, size: f32) -> Element<'a, Message> {
@@ -731,3 +1170,139 @@ fn dot<'a>(color: Color, size: f32) -> Element<'a, Message> {
         })
         .into()
 }
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use iced_test::simulator::Simulator;
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ez-notes-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut work = root.clone();
+        for f in ["Work", "Tribe", "Facilo"] {
+            work = notes::create_folder(&work, f).unwrap();
+        }
+        notes::create_note(&work, "Other").unwrap();
+        let plan = notes::create_note(&work, "Plan").unwrap();
+        std::fs::write(notes::md_path(&plan), "---\ntags: [facilo]\n---\n\nHello **world**\n\n- one\n- two\n").unwrap();
+        root
+    }
+
+    fn app(root: &Path) -> App {
+        let repo = Repo { name: "demo".into(), url: String::new(), path: root.to_path_buf() };
+        let mut app = App { config: Config { repos: vec![repo], active: 0, theme: theme::Colors::dark() }, ..App::default() };
+        app.rescan();
+        app
+    }
+
+    fn settings() -> iced::Settings {
+        iced::Settings { fonts: theme::FONTS.iter().map(|f| (*f).into()).collect(), default_font: theme::SANS, ..Default::default() }
+    }
+
+    /// Click the given text, then feed the produced messages back into the app.
+    fn click(app: &mut App, label: &str) -> Vec<Message> {
+        click_target(app, label)
+    }
+
+    fn click_target<S>(app: &mut App, target: S) -> Vec<Message>
+    where
+        S: iced_test::Selector + Send,
+        S::Output: iced_test::selector::Bounded + Clone + Send + std::marker::Sync + 'static,
+    {
+        let mut ui = Simulator::with_size(settings(), (1280.0, 820.0), app.view());
+        ui.click(target).unwrap_or_else(|e| panic!("click: {e:?}"));
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for m in messages.clone() {
+            let _ = app.update(m);
+        }
+        messages
+    }
+
+    fn snap(app: &App, name: &str) {
+        let mut ui = Simulator::with_size(settings(), (1280.0, 820.0), app.view());
+        let shot = ui.snapshot(&app.theme()).unwrap();
+        let path = std::env::temp_dir().join(format!("ez-notes-{name}.png"));
+        let _ = std::fs::remove_file(path.with_file_name(format!("ez-notes-{name}-wgpu.png")));
+        shot.matches_image(&path).unwrap();
+    }
+
+    #[test]
+    fn add_repo_modal() {
+        let root = temp_repo("modal");
+        let mut app = app(&root);
+        click(&mut app, "Add repo");
+        assert!(app.add_repo.is_some());
+        click(&mut app, "Clone"); // disabled while the URL is empty: no-op
+        assert!(!app.add_repo.as_ref().unwrap().busy);
+        let _ = app.update(Message::AddRepoUrl("git@github.com:me/my-notes.git".into()));
+        let _ = app.update(Message::AddRepoName("../escape".into()));
+        let _ = app.update(Message::AddRepoSubmit);
+        assert!(app.add_repo.as_ref().unwrap().error.is_some(), "invalid name rejected");
+        let _ = app.update(Message::AddRepoName(String::new()));
+        snap(&app, "modal");
+        let _ = app.update(Message::AddRepoSubmit);
+        assert!(app.add_repo.as_ref().unwrap().busy);
+        let _ = app.update(Message::Cloned(Err("git clone: Repository not found.".into())));
+        let form = app.add_repo.as_ref().unwrap();
+        assert!(!form.busy && form.error.as_deref() == Some("git clone: Repository not found."));
+        click(&mut app, "Cancel");
+        assert!(app.add_repo.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rename_from_title() {
+        let root = temp_repo("title");
+        let mut app = app(&root);
+        let facilo = root.join("Work/Tribe/Facilo");
+        let _ = app.update(Message::Open(facilo.join("Plan")));
+        let _ = app.update(Message::EditTitle);
+        assert_eq!(app.title_edit.as_deref(), Some("Plan"));
+        let _ = app.update(Message::TitleInput("Roadmap".into()));
+        snap(&app, "title");
+        let _ = app.update(Message::TitleSubmit);
+        assert!(notes::md_path(&facilo.join("Roadmap")).is_file() && !facilo.join("Plan").exists());
+        assert_eq!(app.note.as_ref().unwrap().dir, facilo.join("Roadmap"));
+        assert!(app.title_edit.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn logo_menu_opens_theme() {
+        let root = temp_repo("menu");
+        let mut app = app(&root);
+        click_target(&mut app, iced_test::selector::id(LOGO_ID));
+        assert!(app.menu_open);
+        {
+            let mut ui = Simulator::with_size(settings(), (1280.0, 820.0), app.view());
+            let shot = ui.snapshot(&app.theme()).unwrap();
+            let path = std::env::temp_dir().join("ez-notes-menu.png");
+            let _ = std::fs::remove_file(path.with_file_name("ez-notes-menu-wgpu.png"));
+            shot.matches_image(&path).unwrap();
+        }
+        click(&mut app, "Theme");
+        assert!(app.show_theme && !app.menu_open);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn open_folder_then_note() {
+        let root = temp_repo("open");
+        let mut app = app(&root);
+        // three levels deep: nested rails used to collapse rows and misroute clicks
+        for folder in ["Work", "Tribe", "Facilo"] {
+            let msgs = click(&mut app, folder);
+            assert!(app.expanded.iter().any(|p| p.ends_with(folder)), "{folder} should stay open, messages: {msgs:?}");
+        }
+        let msgs = click(&mut app, "Plan");
+        assert!(app.note.is_some(), "note should open, messages: {msgs:?}");
+        let mut ui = Simulator::with_size(settings(), (1280.0, 820.0), app.view());
+        let shot = ui.snapshot(&app.theme()).unwrap();
+        let path = std::env::temp_dir().join("ez-notes-ui.png");
+        let _ = std::fs::remove_file(&path);
+        shot.matches_image(&path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+

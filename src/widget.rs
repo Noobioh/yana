@@ -4,6 +4,7 @@
 
 use crate::doc::{Block, Kind};
 use crate::editor::{Action, Editor, Mark, Motion, Pos};
+use crate::theme::{self, Pal};
 use iced::advanced::graphics::text::{Paragraph, cosmic_text};
 use iced::advanced::image::{self as img, Renderer as _};
 use iced::advanced::renderer::{self, Renderer as _};
@@ -16,23 +17,22 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const SIZE: f32 = 16.0;
-const LINE: f32 = 1.5;
+const LINE: f32 = 1.7;
 const INDENT: f32 = 26.0;
 const RAW_PAD: f32 = 10.0;
 const MAX_IMAGE_H: f32 = 480.0;
 /// Clickable space below the last block (places the caret at the end).
 const BOTTOM: f32 = 200.0;
-const LINK: Color = Color::from_rgb(0.15, 0.45, 0.9);
-const MUTED: Color = Color::from_rgb(0.5, 0.5, 0.5);
 
-pub fn view<'a, M: 'a>(editor: &'a Editor, base: &'a Path, on_action: impl Fn(Action) -> M + 'a) -> Element<'a, M> {
-    Element::new(EditorView { editor, base, on_action: Box::new(on_action) })
+pub fn view<'a, M: 'a>(editor: &'a Editor, base: &'a Path, pal: Pal, on_action: impl Fn(Action) -> M + 'a) -> Element<'a, M> {
+    Element::new(EditorView { editor, base, pal, on_action: Box::new(on_action) })
 }
 
 struct EditorView<'a, M> {
     editor: &'a Editor,
     /// Note folder; image paths resolve against it.
     base: &'a Path,
+    pal: Pal,
     on_action: Box<dyn Fn(Action) -> M + 'a>,
 }
 
@@ -40,6 +40,8 @@ struct EditorView<'a, M> {
 struct Laid {
     block: Block,
     width: f32,
+    /// Palette the spans were colored with (part of the cache key).
+    pal: Pal,
     para: Paragraph,
     left: f32,
     top: f32,
@@ -57,10 +59,10 @@ struct State {
 
 fn heading_size(level: u8) -> f32 {
     match level {
-        1 => 30.0,
-        2 => 24.0,
-        3 => 20.0,
-        _ => 17.0,
+        1 => 26.0,
+        2 => 22.0,
+        3 => 18.0,
+        _ => 16.0,
     }
 }
 
@@ -79,23 +81,23 @@ fn gap(b: &Block) -> f32 {
     }
 }
 
-fn spans(b: &Block) -> Vec<text::Span<'static, (), Font>> {
+fn spans(b: &Block, pal: Pal) -> Vec<text::Span<'static, (), Font>> {
     b.spans
         .iter()
         .map(|s| {
             let st = &s.style;
             let mono = st.code || st.raw || b.kind.is_verbatim();
-            let mut f = if mono { Font::MONOSPACE } else { Font::DEFAULT };
+            let mut f = if mono { theme::MONO } else { theme::SANS };
             if st.bold || matches!(b.kind, Kind::Heading(_)) {
-                f.weight = font::Weight::Bold;
+                f.weight = font::Weight::Semibold;
             }
             if st.italic {
                 f.style = font::Style::Italic;
             }
             let span = text::Span::new(s.text.clone()).font(f);
             match () {
-                _ if st.link.is_some() => span.color(LINK).underline(true),
-                _ if st.raw && !b.kind.is_verbatim() => span.color(MUTED),
+                _ if st.link.is_some() => span.color(pal.signal).underline(true),
+                _ if st.raw && !b.kind.is_verbatim() => span.color(pal.faint),
                 _ => span,
             }
         })
@@ -111,13 +113,13 @@ impl<M> EditorView<'_, M> {
         };
         let w = (width - left - if b.kind.is_verbatim() { RAW_PAD } else { 0.0 }).max(10.0);
         let size = block_size(b);
-        let spans = spans(b);
+        let spans = spans(b, self.pal);
         let para = Paragraph::with_spans(text::Text {
             content: &spans[..],
             bounds: Size::new(w, f32::INFINITY),
             size: Pixels(size),
             line_height: text::LineHeight::Relative(LINE),
-            font: Font::DEFAULT,
+            font: theme::SANS,
             align_x: text::Alignment::Default,
             align_y: alignment::Vertical::Top,
             shaping: text::Shaping::Advanced,
@@ -136,7 +138,7 @@ impl<M> EditorView<'_, M> {
                 image = Some((handle, size));
             }
         }
-        Laid { block: b.clone(), width, para, left, top: 0.0, height, image }
+        Laid { block: b.clone(), width, pal: self.pal, para, left, top: 0.0, height, image }
     }
 
     fn key_actions(&self, state: &State, key: &Key, mods: Modifiers, text: Option<&str>, clipboard: &mut dyn Clipboard) -> Option<Vec<Action>> {
@@ -211,7 +213,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
         let mut old: Vec<Option<Laid>> = std::mem::take(&mut state.laid).into_iter().map(Some).collect();
         let mut y = 0.0;
         for (i, b) in self.editor.blocks.iter().enumerate() {
-            let cached = old.get_mut(i).and_then(|o| o.take_if(|l| l.block == *b && l.width == width));
+            let cached = old.get_mut(i).and_then(|o| o.take_if(|l| l.block == *b && l.width == width && l.pal == self.pal));
             let mut l = cached.unwrap_or_else(|| self.build(b, width, renderer));
             if matches!(b.kind, Kind::Heading(_)) && i > 0 {
                 y += 8.0;
@@ -230,7 +232,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
         &self,
         tree: &Tree,
         renderer: &mut iced::Renderer,
-        theme: &Theme,
+        _theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -238,8 +240,8 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        let pal = theme.extended_palette();
-        let selection = Color { a: 0.3, ..pal.primary.base.color };
+        let pal = self.pal;
+        let selection = pal.selection();
         let quad = |r: Rectangle| renderer::Quad { bounds: r, ..Default::default() };
         let mut counters: Vec<(bool, usize)> = vec![];
         for (i, l) in state.laid.iter().enumerate() {
@@ -273,7 +275,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                         border: Border { radius: 4.0.into(), ..Border::default() },
                         ..Default::default()
                     },
-                    pal.background.weak.color,
+                    pal.raised,
                 ),
                 Kind::Image { src, .. } => match &l.image {
                     Some((handle, size)) => {
@@ -282,7 +284,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                     None => renderer.fill_text(
                         label(format!("⚠ image not found: {src}"), l.width),
                         origin,
-                        MUTED,
+                        pal.faint,
                         *viewport,
                     ),
                 },
@@ -293,7 +295,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                 t.size = Pixels(11.0);
                 t.align_x = text::Alignment::Right;
                 let at = Point::new(bounds.x + bounds.width - 8.0, origin.y - RAW_PAD + 2.0);
-                renderer.fill_text(t, at, MUTED, *viewport);
+                renderer.fill_text(t, at, pal.faint, *viewport);
             }
             if let Some(m) = marker {
                 let mut t = label(m, INDENT);
@@ -318,7 +320,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for EditorView<'_, M> {
                     renderer.fill_quad(
                         renderer::Quad {
                             bounds: Rectangle::new(origin, size),
-                            border: Border { color: pal.primary.base.color, width: 2.0, radius: 2.0.into() },
+                            border: Border { color: pal.signal, width: 2.0, radius: 2.0.into() },
                             ..Default::default()
                         },
                         Color::TRANSPARENT,
@@ -419,7 +421,7 @@ fn label(content: String, width: f32) -> text::Text<String, Font> {
         bounds: Size::new(width, SIZE * LINE),
         size: Pixels(SIZE),
         line_height: text::LineHeight::Relative(LINE),
-        font: Font::DEFAULT,
+        font: theme::SANS,
         align_x: text::Alignment::Left,
         align_y: alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
