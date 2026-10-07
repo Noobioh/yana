@@ -1,11 +1,13 @@
 # Every push to main with a feat/fix/perf (or breaking) commit since the last
 # v* tag publishes a release; the version comes from scripts/release-plan.sh.
+# Every push to develop publishes a pre-release, vX.Y.Z-preview.<run number>,
+# where X.Y.Z is the release develop would become.
 # GitHub attaches the source code (zip + tar.gz) to every release automatically.
 name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: write
@@ -25,6 +27,8 @@ jobs:
         with:
           fetch-depth: 0
       - id: plan
+        env:
+          PREVIEW: ${{ github.ref_name == 'develop' && github.run_number || '' }}
         run: ./scripts/release-plan.sh dist/release-notes.md | tee -a "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.version != ''
         uses: actions/upload-artifact@v4
@@ -108,10 +112,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      # creates the tag on the built commit and a full (non-draft) release,
-      # so it shows under Releases and becomes "Latest"
+      # creates the tag on the built commit and a full (non-draft) release;
+      # main becomes "Latest", develop is a pre-release that never does
       - name: Create release
         run: >
           gh release create "$TAG" Yana-*
           --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
-          --title "Yana $TAG" --notes-file release-notes.md --latest
+          --title "Yana $TAG" --notes-file release-notes.md
+          ${{ github.ref_name == 'develop' && '--prerelease --latest=false' || '--latest' }}
