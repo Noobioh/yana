@@ -11,6 +11,9 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
+    // a GUI app on Windows would otherwise flash a console per git call
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // CREATE_NO_WINDOW
     let out = cmd.output().map_err(|e| format!("could not run git: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())

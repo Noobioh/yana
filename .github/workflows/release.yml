@@ -1,0 +1,88 @@
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a release.
+# GitHub attaches the source code (zip + tar.gz) to every release automatically.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-universal
+          - os: windows-latest
+            name: windows-x86_64
+          - os: ubuntu-22.04
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$version"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/ez-notes \
+            target/aarch64-apple-darwin/release/ez-notes \
+            target/x86_64-apple-darwin/release/ez-notes
+          BIN=dist/ez-notes ./scripts/bundle-macos.sh
+          ditto -c -k --keepParent dist/Yana.app "Yana-$VERSION-${{ matrix.name }}.zip"
+
+      - name: Build Windows exe
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release
+          mkdir pkg && cp target/release/ez-notes.exe pkg/Yana.exe && cp README.md pkg/
+          7z a "Yana-$VERSION-${{ matrix.name }}.zip" ./pkg/*
+
+      - name: Build Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir yana && cp target/release/ez-notes yana/yana && cp README.md yana/
+          tar czf "Yana-$VERSION-${{ matrix.name }}.tar.gz" yana
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: Yana-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" Yana-* --repo "$GITHUB_REPOSITORY" --title "Yana $GITHUB_REF_NAME" --generate-notes

@@ -1,3 +1,6 @@
+// release builds on Windows: no console window behind the app
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod doc;
 mod editor;

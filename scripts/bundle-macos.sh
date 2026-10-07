@@ -6,11 +6,15 @@ cd "$(dirname "$0")/.."
 APP=dist/Yana.app
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
-cargo build --release
+# BIN lets CI pass a prebuilt (e.g. universal) binary
+if [ -z "${BIN:-}" ]; then
+    cargo build --release
+    BIN=target/release/ez-notes
+fi
 
 rm -rf "$APP" dist/Yana.iconset
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/ez-notes "$APP/Contents/MacOS/Yana"
+cp "$BIN" "$APP/Contents/MacOS/Yana"
 
 cargo run --quiet --release --example iconset -- dist/Yana.iconset
 iconutil --convert icns dist/Yana.iconset --output "$APP/Contents/Resources/Yana.icns"

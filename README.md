@@ -64,6 +64,28 @@ Notes:
 - An ad-hoc signed app is **not notarized**. If you copy it to another Mac, Gatekeeper will block it the first time. Right-click → **Open** once, or run `xattr -dr com.apple.quarantine /Applications/Yana.app`. To distribute it properly, sign it with a Developer ID certificate and notarize it.
 - When launched from Finder or the Dock, Yana uses `/usr/bin/git` and the SSH agent macOS provides. Keys added with `ssh-add --apple-use-keychain` work as expected.
 
+### Releases
+
+`.github/workflows/release.yml` publishes a GitHub Release whenever a `v*` tag is pushed:
+
+```sh
+# bump version in Cargo.toml first, then:
+git commit -am "chore: release 0.2.0"
+git tag v0.2.0
+git push && git push --tags
+```
+
+The workflow fails if the tag doesn't match the `Cargo.toml` version. The release gets:
+
+| File | Contents |
+|---|---|
+| `Yana-<version>-macos-universal.zip` | `Yana.app` for Apple Silicon and Intel (ad-hoc signed: right-click → **Open** the first time) |
+| `Yana-<version>-windows-x86_64.zip` | `Yana.exe` |
+| `Yana-<version>-linux-x86_64.tar.gz` | `yana` binary (needs a Vulkan or OpenGL driver) |
+| Source code (zip, tar.gz) | Added by GitHub automatically |
+
+Release notes are generated from the commits since the previous tag. All builds need `git` installed on the user's machine.
+
 ### Tests
 
 ```sh
@@ -180,6 +202,7 @@ On Linux and Windows these follow the platform's config and data directories (vi
 | `src/config.rs` | Local settings file |
 | `scripts/bundle-macos.sh` | Builds `dist/Yana.app` |
 | `examples/iconset.rs` | Renders the app icon sizes from the SVG logos |
+| `.github/workflows/release.yml` | Builds and publishes releases for macOS, Windows and Linux |
 
 ## Known limitations
 
