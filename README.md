@@ -66,16 +66,18 @@ Notes:
 
 ### Releases
 
-`.github/workflows/release.yml` publishes a GitHub Release whenever a `v*` tag is pushed:
+Every push to `main` can publish a release (`.github/workflows/release.yml`). The version is derived from the [Conventional Commits](https://www.conventionalcommits.org) since the last `v*` tag:
 
-```sh
-# bump version in Cargo.toml first, then:
-git commit -am "chore: release 0.2.0"
-git tag v0.2.0
-git push && git push --tags
-```
+| Commits since the last release | Next version |
+|---|---|
+| `feat!:` / `fix!:` or a `BREAKING CHANGE:` footer | major (0.4.2 → 1.0.0) |
+| `feat:` | minor (0.4.2 → 0.5.0) |
+| `fix:` / `perf:` | patch (0.4.2 → 0.4.3) |
+| only `docs:`, `chore:`, `ci:`, … | no release |
 
-The workflow fails if the tag doesn't match the `Cargo.toml` version. The release gets:
+The workflow creates the tag and a release (listed under **Releases**, marked *Latest*) with notes grouped into Features, Fixes and Other. The git tag is the source of truth for the version: CI writes it into `Cargo.toml` before building, the version in the repository isn't bumped. Run `./scripts/release-plan.sh` to preview the next version and notes locally.
+
+The release gets:
 
 | File | Contents |
 |---|---|
@@ -84,7 +86,7 @@ The workflow fails if the tag doesn't match the `Cargo.toml` version. The releas
 | `Yana-<version>-linux-x86_64.tar.gz` | `yana` binary (needs a Vulkan or OpenGL driver) |
 | Source code (zip, tar.gz) | Added by GitHub automatically |
 
-Release notes are generated from the commits since the previous tag. All builds need `git` installed on the user's machine.
+All builds need `git` installed on the user's machine.
 
 ### Tests
 
@@ -202,7 +204,8 @@ On Linux and Windows these follow the platform's config and data directories (vi
 | `src/config.rs` | Local settings file |
 | `scripts/bundle-macos.sh` | Builds `dist/Yana.app` |
 | `examples/iconset.rs` | Renders the app icon sizes from the SVG logos |
-| `.github/workflows/release.yml` | Builds and publishes releases for macOS, Windows and Linux |
+| `scripts/release-plan.sh` | Next version and release notes from the commit log |
+| `.github/workflows/release.yml` | Versions, builds and publishes releases on push to `main` |
 
 ## Known limitations
 
