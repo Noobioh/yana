@@ -1,0 +1,12 @@
+[package]
+name = "ez-notes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7.0.0"
+iced = { version = "0.14.0", features = ["image", "advanced", "tokio"] }
+pulldown-cmark = "0.13.4"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
