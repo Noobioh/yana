@@ -1,5 +1,8 @@
 # Yana
 
+[![Build](https://github.com/Noobioh/ez-notes/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Noobioh/ez-notes/actions/workflows/build.yml)
+[![Tests](https://github.com/Noobioh/ez-notes/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Noobioh/ez-notes/actions/workflows/test.yml)
+
 **Yet Another Note Application.** A desktop note-taking app written in Rust with [iced](https://iced.rs). Notes are plain Markdown files in a git repository you own. Every save is committed and pushed automatically, so your notes are versioned, synced, and readable anywhere, even without Yana.
 
 ## Features
