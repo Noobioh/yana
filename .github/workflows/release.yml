@@ -36,8 +36,13 @@ jobs:
           name: release-notes
           path: dist/release-notes.md
 
-  build:
+  test:
     needs: plan
+    if: needs.plan.outputs.version != ''
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [plan, test]
     if: needs.plan.outputs.version != ''
     strategy:
       fail-fast: false
