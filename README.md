@@ -10,6 +10,9 @@
 - **WYSIWYG editor.** You see formatted text, not Markdown syntax. It supports bold, italic, headings, links, images, bulleted and numbered lists (nested), and code blocks.
 - **Git-backed storage.** Connect one or more (private) git repositories and switch between them. Saving commits `updated <file>.md` and pushes it.
 - **Plain files.** Every note is a folder with a Markdown file and its images, organised in folders nested as deep as you like. The repository *is* the export.
+- **Version history.** Every note has a History view listing each saved version with a diff, either of what that version changed or against the current note. Very large diffs ask before rendering. Restoring a version writes it back, with its images, as a new commit, so a restore can be undone too.
+- **Background sync.** Every minute Yana pulls collaborators' changes while you are not typing. If a note you are editing changed meanwhile, saving merges both versions instead of overwriting theirs.
+- **Conflict resolution.** When you and a collaborator change the same part of a note, sync stops and a resolver opens. For each change pick yours, theirs or both, or edit the file by hand. Yana then commits the merge and pushes it. Images and other binary files get a whole-file choice.
 - **Tags** with fixed or automatic colors, stored in the repository so they sync too.
 - **Theming.** Edit the app's color palette, or switch between the dark and light presets.
 
