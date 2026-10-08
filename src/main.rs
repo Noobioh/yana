@@ -2,9 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod conflict;
 mod doc;
 mod editor;
 mod git;
+mod history;
 mod notes;
 mod pdf;
 mod tags;
@@ -14,7 +16,7 @@ mod widget;
 use config::{Config, Repo};
 use doc::Kind;
 use editor::{Action, Editor, Mark, TableOp};
-use iced::widget::{button, center, column, container, mouse_area, opaque, operation, pick_list, row, rule, scrollable, space, stack, svg, text, text_input};
+use iced::widget::{button, center, column, container, mouse_area, opaque, operation, pick_list, row, rule, scrollable, space, stack, svg, text, text_editor, text_input};
 use iced::{Border, Color, Element, Fill, Subscription, Task, Theme, time, window};
 use tags::{Front, TagsFile};
 use notes::Node;
@@ -23,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SAVE_AFTER: Duration = Duration::from_millis(1500);
+/// How often to pull collaborators' changes in the background.
+const PULL_EVERY: Duration = Duration::from_secs(60);
+const MERGE_ABORTED: &str = "merge aborted: your changes are not pushed yet";
 const DIALOG_INPUT: &str = "dialog-input";
 const ADD_REPO_URL: &str = "add-repo-url";
 const TITLE_INPUT: &str = "title-input";
@@ -47,6 +52,10 @@ struct OpenNote {
     /// Tags changed since the last save.
     meta_dirty: bool,
     last_edit: Instant,
+    /// The file as last read from or written to disk. When a pull changes
+    /// the file under an edit, saving merges against this instead of
+    /// overwriting (which would silently revert the collaborator).
+    base: String,
 }
 
 impl OpenNote {
@@ -54,7 +63,20 @@ impl OpenNote {
         let md = std::fs::read_to_string(notes::md_path(&dir))?.replace("\r\n", "\n");
         let (front, body) = tags::split(&md);
         let editor = Editor::new(body);
-        Ok(OpenNote { dir, front, editor, saved_rev: 0, meta_dirty: false, last_edit: Instant::now() })
+        Ok(OpenNote { dir, front, editor, saved_rev: 0, meta_dirty: false, last_edit: Instant::now(), base: md.clone() })
+    }
+
+    /// Replace the content with `text` from disk, keeping the cursor.
+    fn refresh(&mut self, text: String) {
+        let (front, body) = tags::split(&text);
+        let (cursor, focused) = (self.editor.cursor, self.editor.focused);
+        self.editor = Editor::new(body);
+        self.editor.cursor = self.editor.clamp(cursor);
+        self.editor.focused = focused;
+        self.front = front;
+        self.saved_rev = self.editor.revision;
+        self.meta_dirty = false;
+        self.base = text;
     }
 
     fn dirty(&self) -> bool {
@@ -124,6 +146,12 @@ struct App {
     add_repo: Option<AddRepoForm>,
     /// Inline rename of the open note via its title.
     title_edit: Option<String>,
+    /// Version history of the open note, shown instead of the editor.
+    history: Option<history::History>,
+    /// A merge stopped on conflicts; the resolver modal is open while set.
+    conflict: Option<conflict::Conflict>,
+    /// A pull is rewriting the working tree: hold off writing notes.
+    pulling: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +160,8 @@ enum Message {
     /// Toolbar formatting: like Editor, but keeps the editor focused.
     Format(Action),
     Tick,
+    AutoPull,
+    AutoPulled(Result<(), String>),
     SelectRepo(Repo),
     Toggle(PathBuf),
     Open(PathBuf),
@@ -166,6 +196,21 @@ enum Message {
     TitleCancel,
     ThemeColor(&'static str, String),
     ThemePreset(theme::Colors),
+    HistoryOpen,
+    HistoryLoaded(Result<Vec<history::Version>, String>),
+    HistorySelect(usize),
+    HistoryMode(history::Mode),
+    DiffLoaded(usize, history::Mode, Result<String, String>),
+    ShowLargeDiff,
+    Restore,
+    HistoryClose,
+    ConflictSelect(usize),
+    ConflictChoose(usize, conflict::Choice),
+    ConflictKeep(conflict::Choice),
+    ConflictManual,
+    ConflictEdit(text_editor::Action),
+    ConflictAbort,
+    ConflictFinish,
 }
 
 impl App {
@@ -189,6 +234,7 @@ impl App {
         match self.repo_dir() {
             Some(dir) => {
                 self.sync = Sync::Busy;
+                self.pulling = true;
                 Task::perform(async move { git::pull(&dir) }, Message::Pulled)
             }
             None => Task::none(),
@@ -199,16 +245,54 @@ impl App {
         self.error = Some(e.to_string());
     }
 
-    /// Write the open note if it changed, then commit + push.
+    /// Write the open note if it changed, then commit + push. Waits while a
+    /// pull or push (which may pull and merge) rewrites the tree; the next
+    /// tick retries.
     fn save(&mut self) -> Task<Message> {
+        if self.pulling || self.git_busy {
+            return Task::none();
+        }
+        self.flush()
+    }
+
+    /// `save` without waiting for git: for leaving the note (switch, rename,
+    /// quit), where a deferred save would drop the edits.
+    fn flush(&mut self) -> Task<Message> {
+        // the file on disk holds conflict markers until the merge is resolved
+        if self.conflict.is_some() {
+            return Task::none();
+        }
+        let repo = self.repo_dir();
         let Some(n) = self.note.as_mut().filter(|n| n.dirty()) else { return Task::none() };
         let md = notes::md_path(&n.dir);
-        if let Err(e) = std::fs::write(&md, n.content()) {
+        let mine = n.content();
+        let text = match std::fs::read_to_string(&md).map(|s| s.replace("\r\n", "\n")) {
+            // changed on disk since loaded (a pull landed mid-edit): merge, don't overwrite
+            Ok(disk) if disk != n.base && disk != mine => match git::merge_text(&mine, &n.base, &disk) {
+                Ok((merged, false)) => merged,
+                Ok((merged, true)) => {
+                    let rel = repo.as_ref().map(|r| history::rel(r, &md)).unwrap_or_default();
+                    self.conflict = repo.map(|r| conflict::local(&r, rel, &merged));
+                    return Task::none();
+                }
+                Err(e) => {
+                    self.fail(e);
+                    return Task::none();
+                }
+            },
+            _ => mine.clone(),
+        };
+        if let Err(e) = std::fs::write(&md, &text) {
             let msg = format!("could not save {}: {e}", md.display());
             self.fail(msg);
             return Task::none();
         }
         n.saved_rev = n.editor.revision;
+        if text == mine {
+            n.base = text;
+        } else {
+            n.refresh(text); // show the collaborator's merged-in changes
+        }
         if std::mem::take(&mut n.meta_dirty) {
             self.rescan(); // refresh tag dots in the sidebar
         }
@@ -218,7 +302,7 @@ impl App {
 
     fn commit(&mut self, msg: String) -> Task<Message> {
         let Some(dir) = self.repo_dir() else { return Task::none() };
-        if self.git_busy {
+        if self.git_busy || self.conflict.is_some() {
             // one job at a time; later saves to the same repo collapse into one commit
             self.git_queue.retain(|(d, _)| *d != dir);
             self.git_queue.push((dir, msg));
@@ -233,12 +317,73 @@ impl App {
         Task::perform(async move { git::commit_push(&dir, &msg) }, Message::Pushed)
     }
 
+    /// Open or close the conflict resolver to match the repo's merge state.
+    fn check_conflict(&mut self) {
+        let Some(dir) = self.repo_dir() else { return };
+        let merging = git::merging(&dir);
+        match &self.conflict {
+            // new conflict, or the push after resolving hit another one: (re)load
+            None if merging => {}
+            Some(c) if merging && (c.busy || !c.merge) => {}
+            // resolved and pushed, or aborted
+            Some(c) if !merging && (c.busy || c.merge) => {
+                // a local conflict's resolution on disk already holds the edits;
+                // after a merge, unsaved edits stay and the next save merges them in
+                let keep = c.merge && self.note.as_ref().is_some_and(OpenNote::dirty);
+                self.conflict = None;
+                if keep {
+                    self.rescan();
+                } else {
+                    self.reload_note();
+                }
+                return;
+            }
+            _ => return,
+        }
+        self.conflict = Some(conflict::load(&dir));
+        self.history = None;
+        self.menu_open = false;
+    }
+
+    /// Start the next queued commit, if nothing blocks it.
+    fn next_job(&mut self) -> Task<Message> {
+        if self.git_busy || self.conflict.is_some() || self.git_queue.is_empty() {
+            return Task::none();
+        }
+        let (dir, msg) = self.git_queue.remove(0);
+        self.run_commit(dir, msg)
+    }
+
+    /// Re-read the open note from disk, dropping unsaved edits.
+    fn reload_note(&mut self) {
+        self.rescan();
+        if let Some(n) = &mut self.note {
+            match std::fs::read_to_string(notes::md_path(&n.dir)) {
+                Ok(text) => n.refresh(text.replace("\r\n", "\n")),
+                Err(_) => self.note = None,
+            }
+        }
+    }
+
+    fn load_diff(&mut self) -> Task<Message> {
+        let (Some(dir), Some(n), Some(h)) = (self.repo_dir(), &self.note, self.history.as_mut()) else { return Task::none() };
+        if h.versions.is_empty() {
+            return Task::none();
+        }
+        h.diff = None;
+        h.show_large = false;
+        let (versions, idx, mode) = (h.versions.clone(), h.selected, h.mode);
+        let current = history::rel(&dir, &notes::md_path(&n.dir));
+        Task::perform(async move { history::diff(&dir, &versions, idx, mode, &current) }, move |r| Message::DiffLoaded(idx, mode, r))
+    }
+
     fn open_note(&mut self, dir: PathBuf) -> Task<Message> {
-        let save = self.save();
+        let save = self.flush();
         match OpenNote::load(dir.clone()) {
             Ok(note) => {
                 self.note = Some(note);
                 self.title_edit = None;
+                self.history = None;
                 self.selected = Some(dir);
             }
             Err(e) => self.fail(e),
@@ -278,8 +423,26 @@ impl App {
                     return self.save();
                 }
             }
+            Message::AutoPull => {
+                let Some(dir) = self.repo_dir() else { return Task::none() };
+                // quietly, and only when idle: a pending edit reaches the remote
+                // through its own push, which pulls and merges first
+                // after "Abort merge", wait for the user's next save or sync
+                let busy = self.git_busy || self.pulling || matches!(&self.sync, Sync::Busy) || matches!(&self.sync, Sync::Error(e) if e == MERGE_ABORTED);
+                if busy || self.conflict.is_some() || self.note.as_ref().is_some_and(OpenNote::dirty) {
+                    return Task::none();
+                }
+                self.git_busy = true;
+                self.pulling = true;
+                return Task::perform(async move { git::pull(&dir) }, Message::AutoPulled);
+            }
+            Message::AutoPulled(r) => {
+                self.git_busy = false;
+                let pulled = self.update(Message::Pulled(r));
+                return Task::batch([pulled, self.next_job()]);
+            }
             Message::SelectRepo(repo) => {
-                let save = self.save();
+                let save = self.flush();
                 self.config.active = self.config.repos.iter().position(|r| *r == repo).unwrap_or(0);
                 if let Err(e) = self.config.save() {
                     self.fail(e);
@@ -476,6 +639,7 @@ impl App {
                 return self.submit(DialogKind::Rename, value);
             }
             Message::Pulled(r) => {
+                self.pulling = false;
                 if !self.git_busy {
                     self.sync = match r {
                         Ok(()) => Sync::Idle,
@@ -483,13 +647,13 @@ impl App {
                     };
                 }
                 self.rescan();
+                self.check_conflict();
                 // pick up remote changes to the open note unless the user is mid-edit
-                if let Some(n) = self.note.as_mut().filter(|n| !n.dirty()) {
-                    let on_disk = std::fs::read_to_string(notes::md_path(&n.dir)).unwrap_or_default();
-                    if on_disk != n.content() {
-                        if let Ok(fresh) = OpenNote::load(n.dir.clone()) {
-                            *n = fresh;
-                        }
+                // (mid-edit, the next save merges them in instead)
+                if let Some(n) = self.note.as_mut().filter(|n| !n.dirty() && self.conflict.is_none()) {
+                    let on_disk = std::fs::read_to_string(notes::md_path(&n.dir)).unwrap_or_default().replace("\r\n", "\n");
+                    if on_disk != n.base {
+                        n.refresh(on_disk);
                     }
                 }
             }
@@ -499,18 +663,28 @@ impl App {
                     Ok(()) => Sync::Idle,
                     Err(e) => Sync::Error(e),
                 };
-                if !self.git_queue.is_empty() {
-                    let (dir, msg) = self.git_queue.remove(0);
-                    return self.run_commit(dir, msg);
-                }
+                self.check_conflict();
+                return self.next_job();
             }
             Message::CloseRequested(id) => {
-                // flush synchronously: the process is about to exit
-                if let Some(n) = self.note.as_ref().filter(|n| n.dirty()) {
-                    let md = notes::md_path(&n.dir);
-                    if std::fs::write(&md, n.content()).is_ok() {
-                        let file = md.file_name().unwrap().to_string_lossy().into_owned();
-                        self.git_queue.push((self.repo_dir().unwrap(), format!("updated {file}")));
+                // flush synchronously: the process is about to exit. save() merges
+                // with a pull that landed mid-edit; git_busy routes its commit into
+                // the queue instead of a task that would never run.
+                let (pulling, git_busy) = (self.pulling, self.git_busy);
+                self.pulling = false;
+                self.git_busy = true;
+                let _ = self.flush();
+                if self.note.as_ref().is_some_and(OpenNote::dirty) {
+                    // blocked by a conflict: writing would commit markers or revert a collaborator
+                    let quit = rfd::MessageDialog::new()
+                        .set_title("Unsaved edits")
+                        .set_description("Your latest edits can't be saved until the conflict is resolved. Quit anyway and lose them?")
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show()
+                        == rfd::MessageDialogResult::Yes;
+                    if !quit {
+                        (self.pulling, self.git_busy) = (pulling, git_busy);
+                        return Task::none();
                     }
                 }
                 for (dir, msg) in self.git_queue.drain(..) {
@@ -550,8 +724,169 @@ impl App {
                     self.fail(e);
                 }
             }
+            Message::HistoryOpen => {
+                let (Some(dir), Some(n)) = (self.repo_dir(), &self.note) else { return Task::none() };
+                let md = history::rel(&dir, &notes::md_path(&n.dir));
+                let save = self.save();
+                self.history = Some(history::History::new());
+                self.show_theme = false;
+                let load = Task::perform(async move { history::load(&dir, &md) }, Message::HistoryLoaded);
+                return Task::batch([save, load]);
+            }
+            Message::HistoryLoaded(r) => {
+                let Some(h) = self.history.as_mut() else { return Task::none() };
+                match r {
+                    Ok(versions) => {
+                        h.versions = versions;
+                        h.selected = 0;
+                        return self.load_diff();
+                    }
+                    Err(e) => h.error = Some(e),
+                }
+            }
+            Message::HistorySelect(idx) => {
+                if let Some(h) = self.history.as_mut() {
+                    h.selected = idx;
+                }
+                return self.load_diff();
+            }
+            Message::HistoryMode(mode) => {
+                if let Some(h) = self.history.as_mut() {
+                    h.mode = mode;
+                }
+                return self.load_diff();
+            }
+            Message::DiffLoaded(idx, mode, r) => {
+                // a slower answer for a version no longer selected: drop it
+                if let Some(h) = self.history.as_mut().filter(|h| h.selected == idx && h.mode == mode) {
+                    h.diff = Some(r);
+                }
+            }
+            Message::ShowLargeDiff => {
+                if let Some(h) = self.history.as_mut() {
+                    h.show_large = true;
+                }
+            }
+            Message::HistoryClose => self.history = None,
+            Message::Restore => {
+                let (Some(dir), Some(n), Some(h)) = (self.repo_dir(), &self.note, &self.history) else { return Task::none() };
+                let Some(v) = h.versions.get(h.selected).cloned() else { return Task::none() };
+                if self.git_busy || self.pulling {
+                    return Task::none(); // the button says "Saving…"; restoring now could race that commit or pull
+                }
+                let (note_dir, file) = (n.dir.clone(), notes::md_path(&n.dir).file_name().unwrap().to_string_lossy().into_owned());
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("Restore version")
+                    .set_description(format!(
+                        "Restore \"{}\" to the version from {}? The current text stays in the history, so you can undo this.",
+                        note_dir.file_name().unwrap_or_default().to_string_lossy(),
+                        v.date
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    == rfd::MessageDialogResult::Yes;
+                if !confirmed {
+                    return Task::none();
+                }
+                if let Err(e) = history::restore(&dir, &v, &note_dir) {
+                    self.fail(e);
+                    return Task::none();
+                }
+                self.history = None;
+                self.reload_note();
+                return self.commit(format!("restored {file} to {}", v.short));
+            }
+            Message::ConflictSelect(k) => {
+                if let Some(c) = self.conflict.as_mut() {
+                    c.selected = k;
+                }
+            }
+            Message::ConflictChoose(idx, choice) => {
+                if let Some(conflict::Kind::Text { choices, .. }) = self.conflict_file() {
+                    choices[idx] = Some(choice);
+                }
+            }
+            Message::ConflictKeep(choice) => {
+                if let Some(conflict::Kind::Whole { pick, .. }) = self.conflict_file() {
+                    *pick = Some(choice);
+                }
+            }
+            Message::ConflictManual => {
+                if let Some(conflict::Kind::Text { segments, choices, manual }) = self.conflict_file() {
+                    *manual = match manual {
+                        Some(_) => None,
+                        None => Some(text_editor::Content::with_text(&conflict::render(segments, choices))),
+                    };
+                }
+            }
+            Message::ConflictEdit(action) => {
+                if let Some(conflict::Kind::Text { manual: Some(content), .. }) = self.conflict_file() {
+                    content.perform(action);
+                }
+            }
+            Message::ConflictAbort if self.conflict.as_ref().is_some_and(|c| !c.merge) => {
+                let author = self.conflict.as_ref().map(|c| c.author.clone()).unwrap_or_default();
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("Discard my edits")
+                    .set_description(format!("Discard your unsaved edits to this note and keep {author}'s version?"))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    == rfd::MessageDialogResult::Yes;
+                if confirmed {
+                    self.conflict = None;
+                    self.reload_note();
+                }
+            }
+            Message::ConflictAbort => {
+                let Some(dir) = self.repo_dir() else { return Task::none() };
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("Abort merge")
+                    .set_description(
+                        "Stop merging? Your notes go back to how they were before this sync. Your changes stay saved on this computer but can't be pushed until the conflict is resolved, so the next sync asks again.",
+                    )
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    == rfd::MessageDialogResult::Yes;
+                if !confirmed {
+                    return Task::none();
+                }
+                if let Err(e) = git::run(&dir, &["merge", "--abort"]) {
+                    self.fail(e);
+                }
+                self.check_conflict();
+                self.sync = Sync::Error(MERGE_ABORTED.into());
+            }
+            Message::ConflictFinish => {
+                let Some(dir) = self.repo_dir() else { return Task::none() };
+                let Some(c) = self.conflict.as_mut().filter(|c| c.ready()) else { return Task::none() };
+                let resolved: Vec<_> = c
+                    .files
+                    .iter()
+                    .filter_map(|f| {
+                        let res = f.resolution()?;
+                        let exists = match (&f.kind, &res) {
+                            (conflict::Kind::Whole { mine, .. }, conflict::Resolution::Mine) => *mine,
+                            (conflict::Kind::Whole { theirs, .. }, conflict::Resolution::Theirs) => *theirs,
+                            _ => true,
+                        };
+                        Some((f.path.clone(), res, exists))
+                    })
+                    .collect();
+                c.busy = true;
+                let merge = c.merge;
+                self.git_busy = true;
+                self.sync = Sync::Busy;
+                // reports through Pushed, which closes the resolver once the merge is gone
+                return Task::perform(async move { conflict::finish(&dir, resolved, merge) }, Message::Pushed);
+            }
         }
         Task::none()
+    }
+
+    /// The file selected in the conflict resolver.
+    fn conflict_file(&mut self) -> Option<&mut conflict::Kind> {
+        let c = self.conflict.as_mut()?;
+        c.files.get_mut(c.selected).map(|f| &mut f.kind)
     }
 
     fn clone_repo(&mut self) -> Task<Message> {
@@ -699,7 +1034,7 @@ impl App {
             }),
             DialogKind::Rename => {
                 let Some(old) = self.selected.clone() else { return Task::none() };
-                let save = self.save();
+                let save = self.flush();
                 let open = self.note.as_ref().and_then(|n| n.dir.strip_prefix(&old).ok().map(Path::to_path_buf));
                 let old_name = old.file_name().unwrap_or_default().to_string_lossy().into_owned();
                 match notes::rename(&old, &name) {
@@ -734,12 +1069,14 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let close = window::close_requests().map(Message::CloseRequested);
+        let mut subs = vec![window::close_requests().map(Message::CloseRequested)];
         if self.note.as_ref().is_some_and(OpenNote::dirty) {
-            Subscription::batch([close, time::every(Duration::from_millis(500)).map(|_| Message::Tick)])
-        } else {
-            close
+            subs.push(time::every(Duration::from_millis(500)).map(|_| Message::Tick));
         }
+        if self.config.active().is_some() {
+            subs.push(time::every(PULL_EVERY).map(|_| Message::AutoPull));
+        }
+        Subscription::batch(subs)
     }
 
 
@@ -857,6 +1194,9 @@ impl App {
         }
         let body: Element<'_, Message> = match &self.note {
             _ if self.show_theme => scrollable(container(self.theme_editor(p)).padding([24, 32]).max_width(760)).height(Fill).into(),
+            Some(n) if let Some(h) = &self.history => {
+                history::view(h, n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned(), self.git_busy || self.pulling, p)
+            }
             Some(n) => {
                 let rel = self.repo_dir().and_then(|r| n.dir.parent()?.strip_prefix(r).ok().map(Path::to_path_buf));
                 let crumbs = rel
@@ -917,6 +1257,12 @@ impl App {
             let backdrop = container(space().width(Fill).height(Fill)).style(p.fill(theme::alpha(Color::BLACK, 0.55), 0.0));
             layers.push(mouse_area(backdrop).on_press(Message::AddRepoCancel).into());
             layers.push(center(opaque(self.add_repo_modal(form, p))).into());
+        }
+        if let Some(c) = &self.conflict {
+            // no click-to-dismiss: the merge has to be finished or aborted
+            let backdrop = container(space().width(Fill).height(Fill)).style(p.fill(theme::alpha(Color::BLACK, 0.55), 0.0));
+            layers.push(opaque(backdrop));
+            layers.push(container(opaque(conflict::view(c, p))).center_x(Fill).height(Fill).padding([40, 48]).into());
         }
         stack(layers).into()
     }
@@ -1063,7 +1409,10 @@ impl App {
                 op("− Col", TableOp::RemoveColumn),
             ]));
         }
-        bar.push(space().width(Fill)).push(btn(Some(i::UPLOAD), "PDF", p.ghost()).on_press(Message::ExportPdf)).into()
+        bar.push(space().width(Fill))
+            .push(btn(Some(i::HISTORY), "History", p.ghost()).on_press(Message::HistoryOpen))
+            .push(btn(Some(i::UPLOAD), "PDF", p.ghost()).on_press(Message::ExportPdf))
+            .into()
     }
 
     fn theme_editor(&self, p: Pal) -> Element<'_, Message> {
@@ -1353,6 +1702,159 @@ mod ui_tests {
         let path = std::env::temp_dir().join("ez-notes-ui.png");
         let _ = std::fs::remove_file(&path);
         shot.matches_image(&path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn version(n: usize) -> history::Version {
+        history::Version {
+            sha: format!("{n:040}"),
+            short: format!("{n:07}"),
+            author: "Kim".into(),
+            ago: format!("{n} hours ago"),
+            date: "08 Oct 2026 10:00".into(),
+            subject: format!("updated Plan.md #{n}"),
+            path: "Work/Tribe/Facilo/Plan/Plan.md".into(),
+        }
+    }
+
+    #[test]
+    fn history_panel() {
+        let root = temp_repo("history");
+        let mut app = app(&root);
+        let _ = app.update(Message::Open(root.join("Work/Tribe/Facilo/Plan")));
+        click(&mut app, "History");
+        assert!(app.history.is_some());
+        let _ = app.update(Message::HistoryLoaded(Ok(vec![version(1), version(2)])));
+        let _ = app.update(Message::DiffLoaded(0, history::Mode::Changes, Ok("@@ -1 +1 @@\n-old line\n+new line\n same\n".into())));
+        click(&mut app, "updated Plan.md #2");
+        assert_eq!(app.history.as_ref().unwrap().selected, 1);
+        assert!(app.history.as_ref().unwrap().diff.is_none(), "loading the newly selected diff");
+        let _ = app.update(Message::DiffLoaded(0, history::Mode::Changes, Ok("+stale".into())));
+        assert!(app.history.as_ref().unwrap().diff.is_none(), "stale answer dropped");
+        let _ = app.update(Message::DiffLoaded(1, history::Mode::Changes, Ok("+x\n".repeat(history::LARGE_DIFF_LINES + 1))));
+        let msgs = click(&mut app, "Show diff");
+        assert!(matches!(msgs[..], [Message::ShowLargeDiff]) && app.history.as_ref().unwrap().show_large);
+        let _ = app.update(Message::DiffLoaded(1, history::Mode::Changes, Ok("@@ -1 +1 @@\n-old line\n+new line\n".into())));
+        snap(&app, "history");
+        click(&mut app, "Compare with current");
+        assert_eq!(app.history.as_ref().unwrap().mode, history::Mode::VsCurrent);
+        click(&mut app, "Back to note");
+        assert!(app.history.is_none() && app.note.is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn conflict_resolver() {
+        let root = temp_repo("conflict");
+        let mut app = app(&root);
+        let text = "Intro\n<<<<<<< HEAD\nmy line\n||||||| base\nold\n=======\ntheir line\n>>>>>>> origin/main\nOutro\n";
+        let segments = conflict::parse(text);
+        app.conflict = Some(conflict::Conflict {
+            files: vec![
+                conflict::File {
+                    path: "Work/Plan/Plan.md".into(),
+                    kind: conflict::Kind::Text { segments, choices: vec![None], manual: None },
+                },
+                conflict::File { path: "Work/Plan/pic.png".into(), kind: conflict::Kind::Whole { mine: true, theirs: true, pick: None } },
+            ],
+            selected: 0,
+            author: "Kim".into(),
+            busy: false,
+            merge: true,
+        });
+        assert!(app.save().units() == 0, "no writes while merging");
+        click(&mut app, "Use theirs");
+        snap(&app, "conflict");
+        assert!(!app.conflict.as_ref().unwrap().ready(), "image still open");
+        click(&mut app, "pic.png");
+        click(&mut app, "Keep mine");
+        assert!(app.conflict.as_ref().unwrap().ready());
+        let c = app.conflict.as_ref().unwrap();
+        assert!(matches!(c.files[0].resolution(), Some(conflict::Resolution::Text(t)) if t == "Intro\ntheir line\nOutro\n"));
+        let msgs = click(&mut app, "Commit & push");
+        assert!(matches!(msgs[..], [Message::ConflictFinish]));
+        assert!(app.conflict.as_ref().unwrap().busy && app.git_busy);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Open Plan, type `typed` at the start of the first line, then let a
+    /// "pull" rewrite the file on disk with `remote(original)`.
+    fn edit_while_pulled(name: &str, typed: &str, remote: impl Fn(&str) -> String) -> (PathBuf, App) {
+        let root = temp_repo(name);
+        let mut app = app(&root);
+        let plan = root.join("Work/Tribe/Facilo/Plan");
+        let _ = app.update(Message::Open(plan.clone()));
+        let n = app.note.as_mut().unwrap();
+        n.editor.perform(Action::Select { pos: editor::Pos { block: 0, offset: 0 }, extend: false });
+        n.editor.perform(Action::Insert(typed.into()));
+        let md = notes::md_path(&plan);
+        let original = std::fs::read_to_string(&md).unwrap();
+        std::fs::write(&md, remote(&original)).unwrap();
+        (root, app)
+    }
+
+    #[test]
+    fn save_merges_a_pull_that_landed_mid_edit() {
+        let (root, mut app) = edit_while_pulled("midedit", "Local ", |o| o.replace("- two", "- two (remote)"));
+        let _ = app.update(Message::Pulled(Ok(()))); // dirty: left alone, no reload
+        assert!(app.note.as_ref().unwrap().dirty());
+        let _ = app.save();
+        let disk = std::fs::read_to_string(notes::md_path(&root.join("Work/Tribe/Facilo/Plan"))).unwrap();
+        assert!(disk.contains("Local Hello") && disk.contains("two (remote)"), "both kept, nothing reverted:\n{disk}");
+        let n = app.note.as_ref().unwrap();
+        assert!(!n.dirty() && n.content() == disk, "editor shows the merged note");
+        assert_eq!(n.editor.cursor.block, 0, "cursor kept");
+        assert!(app.conflict.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clashing_edit_opens_the_resolver() {
+        let (root, mut app) = edit_while_pulled("clash", "Local ", |o| o.replace("Hello", "Remote hello"));
+        let _ = app.save();
+        let c = app.conflict.as_ref().expect("resolver opens");
+        assert!(!c.merge && c.files.len() == 1);
+        let disk = std::fs::read_to_string(notes::md_path(&root.join("Work/Tribe/Facilo/Plan"))).unwrap();
+        assert!(disk.contains("Remote hello") && !disk.contains("<<<<<<<"), "disk untouched until resolved");
+        click(&mut app, "Use both");
+        assert!(app.conflict.as_ref().unwrap().ready());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn edits_typed_during_a_merge_survive_its_resolution() {
+        let root = temp_repo("keepedits");
+        let mut app = app(&root);
+        let _ = app.update(Message::Open(root.join("Work/Tribe/Facilo/Plan")));
+        app.note.as_mut().unwrap().editor.perform(Action::Insert("typed during push ".into()));
+        app.conflict = Some(conflict::Conflict { files: vec![], selected: 0, author: "Kim".into(), busy: true, merge: true });
+        app.check_conflict(); // resolved and pushed: no MERGE_HEAD
+        assert!(app.conflict.is_none());
+        let n = app.note.as_ref().unwrap();
+        assert!(n.dirty() && n.content().contains("typed during push"), "unsaved edits kept");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn background_pull_waits_for_idle() {
+        let root = temp_repo("autopull");
+        let mut app = app(&root);
+        let _ = app.update(Message::Open(root.join("Work/Tribe/Facilo/Plan")));
+        app.note.as_mut().unwrap().editor.perform(Action::Insert("x".into()));
+        let _ = app.update(Message::AutoPull);
+        assert!(!app.pulling, "skipped while an edit is pending");
+        app.note.as_mut().unwrap().saved_rev = app.note.as_ref().unwrap().editor.revision;
+        let _ = app.update(Message::AutoPull);
+        assert!(app.pulling && app.git_busy);
+        let md = notes::md_path(&root.join("Work/Tribe/Facilo/Plan"));
+        let before = std::fs::read_to_string(&md).unwrap();
+        app.note.as_mut().unwrap().editor.perform(Action::Insert("y".into())); // typed during the pull
+        let _ = app.save();
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), before, "no writes during a pull");
+        let _ = app.update(Message::AutoPulled(Ok(())));
+        assert!(!app.pulling && !app.git_busy && matches!(app.sync, Sync::Idle));
+        let _ = app.save();
+        assert_ne!(std::fs::read_to_string(&md).unwrap(), before, "saves resume after the pull");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

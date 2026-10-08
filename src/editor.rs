@@ -258,7 +258,7 @@ impl Editor {
         self.coalesce = false;
     }
 
-    fn clamp(&self, p: Pos) -> Pos {
+    pub fn clamp(&self, p: Pos) -> Pos {
         let block = p.block.min(self.blocks.len() - 1);
         let text = self.blocks[block].text();
         let mut offset = p.offset.min(text.len());

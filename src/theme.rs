@@ -437,6 +437,9 @@ pub mod i {
     pub const PALETTE: char = '\u{e1dd}';
     pub const X: char = '\u{e1b2}';
     pub const ALERT: char = '\u{e193}';
+    pub const ARROW_LEFT: char = '\u{e04c}';
+    pub const HISTORY: char = '\u{e1f5}';
+    pub const GIT_MERGE: char = '\u{e0e7}';
 }
 
 #[cfg(test)]
