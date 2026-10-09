@@ -104,9 +104,11 @@ The UI tests drive the real views headlessly with [`iced_test`](https://crates.i
 
 ## Getting started
 
-1. Click **Add repo** and paste the repository URL (e.g. `git@github.com:you/notes.git`). An empty repository is fine.
+1. Click **Add repo** and paste the repository URL (e.g. `git@github.com:you/notes.git`). An empty repository is fine. Or choose **Open local folder…** to keep notes in a folder on your machine: it is used in place, and becomes a git repository if it isn't one yet.
 2. Create folders and notes with **Folder** and **Note** in the sidebar.
 3. Write. About 1.5 seconds after you stop typing, the note is saved, committed and pushed. The status in the top bar shows *unsaved*, *syncing…*, *synced*, or the git error.
+
+A local repository without a remote commits every save but pushes nothing. To put it online, create an empty repository on your git host, click **Publish…** and paste its URL. Yana pushes everything and syncs from then on.
 
 **Sync** saves the open note, pulls the latest changes and pushes. Remote changes to the open note are loaded unless you're in the middle of editing it. Unsaved changes are flushed when you close the window.
 
@@ -193,7 +195,7 @@ Click the logo and choose **Theme**. Each of the ten palette colors (ground, pan
 
 On Linux and Windows these follow the platform's config and data directories (via the [`dirs`](https://crates.io/crates/dirs) crate).
 
-**Remove repo** deletes the local clone (anything not yet pushed is lost) but never touches the remote repository.
+**Remove repo** deletes the local clone (anything not yet pushed is lost) but never touches the remote repository. A repository added with **Open local folder…** is only forgotten; its folder stays on disk.
 
 ## Project layout
 
@@ -204,7 +206,7 @@ On Linux and Windows these follow the platform's config and data directories (vi
 | `src/widget.rs` | The custom WYSIWYG widget: layout, drawing, mouse and keyboard input |
 | `src/doc.rs` | Document model and Markdown parsing/serialisation |
 | `src/notes.rs` | Notes on disk: tree scanning, create/rename/delete, images, export |
-| `src/git.rs` | Wrapper around the `git` command line (clone, pull, commit, push) |
+| `src/git.rs` | Wrapper around the `git` command line (clone, init, pull, commit, push, publish) |
 | `src/tags.rs` | Front matter and tag colors |
 | `src/theme.rs` | Palette, presets, widget styles, fonts and icons |
 | `src/config.rs` | Local settings file |
