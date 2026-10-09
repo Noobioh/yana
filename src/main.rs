@@ -11,6 +11,7 @@ mod notes;
 mod pdf;
 mod tags;
 mod theme;
+mod update;
 mod widget;
 
 use config::{Config, Repo};
@@ -20,7 +21,7 @@ use iced::widget::{button, center, column, container, mouse_area, opaque, operat
 use iced::{Border, Color, Element, Fill, Subscription, Task, Theme, time, window};
 use tags::{Front, TagsFile};
 use notes::Node;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -98,6 +99,8 @@ enum DialogKind {
     AddTag,
     /// Change the color of the tag named in the dialog value.
     TagColor,
+    /// Push a local-only repo to a remote URL.
+    Publish,
 }
 
 #[derive(Default)]
@@ -115,6 +118,39 @@ fn repo_name_from_url(url: &str) -> String {
     if name.is_empty() { "notes".into() } else { name.into() }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Sort {
+    /// The folder tree; notes in each folder most recent first.
+    #[default]
+    Folders,
+    /// Every note in one list, most recent first.
+    Notes,
+}
+
+impl Sort {
+    const ALL: [Sort; 2] = [Sort::Folders, Sort::Notes];
+}
+
+impl std::fmt::Display for Sort {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Sort::Folders => "Sort folders on recency",
+            Sort::Notes => "Sort notes on recency",
+        })
+    }
+}
+
+/// Outcome of asking GitHub for a newer release.
+#[derive(Default)]
+enum Update {
+    #[default]
+    Unknown,
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed,
+}
+
 #[derive(Default)]
 enum Sync {
     #[default]
@@ -127,6 +163,14 @@ enum Sync {
 struct App {
     config: Config,
     tree: Vec<Node>,
+    sort: Sort,
+    /// Created/updated per `.md` path, from git history.
+    dates: HashMap<PathBuf, history::Dates>,
+    /// (repo, HEAD) the dates were read at: history only changes with HEAD.
+    dates_at: (PathBuf, String),
+    /// The tree was rescanned since the last dates check.
+    dates_stale: bool,
+    dates_loading: bool,
     expanded: HashSet<PathBuf>,
     selected: Option<PathBuf>,
     note: Option<OpenNote>,
@@ -135,7 +179,10 @@ struct App {
     git_busy: bool,
     /// Commits waiting for the running git job: (repo dir, message).
     git_queue: Vec<(PathBuf, String)>,
+    /// Shown as a dismissable toast.
     error: Option<String>,
+    /// Last sync error toasted, so a repeating one (auto-pull) pops up once.
+    sync_error: Option<String>,
     tags: TagsFile,
     /// Color chosen in the tag dialog; None = keep existing (or auto for new tags).
     dialog_color: Option<String>,
@@ -152,6 +199,7 @@ struct App {
     conflict: Option<conflict::Conflict>,
     /// A pull is rewriting the working tree: hold off writing notes.
     pulling: bool,
+    update: Update,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +211,9 @@ enum Message {
     AutoPull,
     AutoPulled(Result<(), String>),
     SelectRepo(Repo),
+    SortBy(Sort),
+    /// None: HEAD hadn't moved.
+    DatesLoaded(Result<Option<DatesAt>, String>),
     Toggle(PathBuf),
     Open(PathBuf),
     Dialog(DialogKind),
@@ -175,7 +226,10 @@ enum Message {
     ExportPdf,
     InsertImage,
     SyncNow,
+    /// Re-show the sync error after its toast was dismissed.
+    ShowSyncError,
     Cloned(Result<Repo, String>),
+    Published(PathBuf, Result<String, String>),
     Pulled(Result<(), String>),
     Pushed(Result<(), String>),
     CloseRequested(window::Id),
@@ -186,6 +240,7 @@ enum Message {
     ToggleTheme,
     ToggleMenu,
     AddRepoOpen,
+    AddLocalRepo,
     AddRepoUrl(String),
     AddRepoName(String),
     AddRepoSubmit,
@@ -211,21 +266,34 @@ enum Message {
     ConflictEdit(text_editor::Action),
     ConflictAbort,
     ConflictFinish,
+    CheckUpdate,
+    UpdateChecked(Result<Option<String>, String>),
+    OpenReleases,
 }
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let mut app = App { config: Config::load(), ..App::default() };
         let task = app.open_repo();
-        (app, task)
+        let dates = app.load_dates();
+        let update = app.check_update();
+        (app, Task::batch([task, dates, update]))
     }
 
+    fn check_update(&mut self) -> Task<Message> {
+        self.update = Update::Checking;
+        Task::perform(async { update::check() }, Message::UpdateChecked)
+    }
+
+    /// The active repo's folder, unless it was deleted (or isn't a repo
+    /// anymore) since it was added.
     fn repo_dir(&self) -> Option<PathBuf> {
-        self.config.active().map(|r| r.path.clone())
+        self.config.active().map(|r| r.path.clone()).filter(|p| p.join(".git").exists())
     }
 
     fn rescan(&mut self) {
-        self.tree = self.repo_dir().map(|d| notes::scan(&d)).unwrap_or_default();
+        self.dates_stale = true; // a commit may have moved dates; update() checks in the background
+        self.tree = self.repo_dir().map(|d| notes::scan(&d, &self.dates)).unwrap_or_default();
         self.tags = self.repo_dir().map(|d| TagsFile::load(&d)).unwrap_or_default();
     }
 
@@ -237,12 +305,32 @@ impl App {
                 self.pulling = true;
                 Task::perform(async move { git::pull(&dir) }, Message::Pulled)
             }
-            None => Task::none(),
+            None => {
+                let missing = self.config.active().map(|r| format!("{} is missing at {}: restore it or remove the repo", r.name, r.path.display()));
+                self.set_sync(missing.map_or(Ok(()), Err));
+                Task::none()
+            }
         }
     }
 
     fn fail(&mut self, e: impl ToString) {
         self.error = Some(e.to_string());
+    }
+
+    fn set_sync(&mut self, r: Result<(), String>) {
+        match r {
+            Ok(()) => {
+                self.sync = Sync::Idle;
+                self.sync_error = None;
+            }
+            Err(e) => {
+                if self.sync_error.as_ref() != Some(&e) {
+                    self.sync_error = Some(e.clone());
+                    self.fail(&e);
+                }
+                self.sync = Sync::Error(e);
+            }
+        }
     }
 
     /// Write the open note if it changed, then commit + push. Waits while a
@@ -403,6 +491,20 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        Task::batch([task, self.load_dates()])
+    }
+
+    /// Re-read note dates off the UI thread after a rescan, one load at a time.
+    fn load_dates(&mut self) -> Task<Message> {
+        let Some(dir) = self.repo_dir().filter(|_| self.dates_stale && !self.dates_loading) else { return Task::none() };
+        self.dates_stale = false;
+        self.dates_loading = true;
+        let known = self.dates_at.clone();
+        Task::perform(async move { read_dates(dir, &known) }, Message::DatesLoaded)
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         let format = matches!(message, Message::Format(_));
         match message {
             Message::Editor(Action::RequestLink) | Message::Format(Action::RequestLink) => {
@@ -450,6 +552,18 @@ impl App {
                 self.note = None;
                 self.selected = None;
                 return Task::batch([save, self.open_repo()]);
+            }
+            Message::SortBy(sort) => self.sort = sort,
+            Message::DatesLoaded(r) => {
+                self.dates_loading = false;
+                // on error keep the old dates; the next rescan retries
+                if let Ok(Some((at, dates))) = r
+                    && self.repo_dir().as_ref() == Some(&at.0)
+                {
+                    self.dates = dates;
+                    self.dates_at = at;
+                    self.rescan();
+                }
             }
             Message::Toggle(path) => {
                 if !self.expanded.remove(&path) {
@@ -509,13 +623,20 @@ impl App {
             }
             Message::RemoveRepo => {
                 let Some(repo) = self.config.active().cloned() else { return Task::none() };
-                let confirmed = rfd::MessageDialog::new()
-                    .set_title("Remove repository")
-                    .set_description(format!(
+                // only delete what we cloned; a local folder belongs to the user
+                let clone = repo.path.starts_with(config::clones_dir());
+                let description = if clone {
+                    format!(
                         "Remove \"{}\" from ez-notes? The local clone at {} is deleted; anything not pushed yet is lost. The remote repository is not touched.",
                         repo.name,
                         repo.path.display()
-                    ))
+                    )
+                } else {
+                    format!("Remove \"{}\" from ez-notes? The folder at {} is kept.", repo.name, repo.path.display())
+                };
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("Remove repository")
+                    .set_description(description)
                     .set_buttons(rfd::MessageButtons::YesNo)
                     .show()
                     == rfd::MessageDialogResult::Yes;
@@ -524,7 +645,9 @@ impl App {
                 }
                 self.note = None;
                 self.selected = None;
-                let _ = std::fs::remove_dir_all(&repo.path);
+                if clone {
+                    let _ = std::fs::remove_dir_all(&repo.path);
+                }
                 self.config.repos.retain(|r| *r != repo);
                 self.config.active = 0;
                 if let Err(e) = self.config.save() {
@@ -587,6 +710,35 @@ impl App {
                 self.selected = None;
                 return self.open_repo();
             }
+            Message::Published(dir, r) => {
+                self.git_busy = false;
+                match r {
+                    Ok(url) => {
+                        self.set_sync(Ok(()));
+                        if let Some(repo) = self.config.repos.iter_mut().find(|r| r.path == dir) {
+                            repo.url = url;
+                        }
+                        if let Err(e) = self.config.save() {
+                            self.fail(e);
+                        }
+                    }
+                    Err(e) => self.set_sync(Err(e)),
+                }
+                return self.next_job();
+            }
+            Message::AddLocalRepo => {
+                let Some(form) = self.add_repo.as_mut().filter(|f| !f.busy) else { return Task::none() };
+                let Some(path) = rfd::FileDialog::new().set_title("Open local folder").pick_folder() else { return Task::none() };
+                if self.config.repos.iter().any(|r| r.path == path) {
+                    form.error = Some("This folder is already added.".into());
+                    return Task::none();
+                }
+                form.busy = true;
+                form.error = None;
+                self.sync = Sync::Busy;
+                let name = path.file_name().map_or_else(|| "notes".into(), |n| n.to_string_lossy().into_owned());
+                return Task::perform(async move { git::open_local(&path).map(|url| Repo { name, url, path }) }, Message::Cloned);
+            }
             Message::Cloned(Err(e)) => match self.add_repo.as_mut() {
                 Some(form) => {
                     form.busy = false;
@@ -641,10 +793,7 @@ impl App {
             Message::Pulled(r) => {
                 self.pulling = false;
                 if !self.git_busy {
-                    self.sync = match r {
-                        Ok(()) => Sync::Idle,
-                        Err(e) => Sync::Error(e),
-                    };
+                    self.set_sync(r);
                 }
                 self.rescan();
                 self.check_conflict();
@@ -659,10 +808,8 @@ impl App {
             }
             Message::Pushed(r) => {
                 self.git_busy = false;
-                self.sync = match r {
-                    Ok(()) => Sync::Idle,
-                    Err(e) => Sync::Error(e),
-                };
+                self.set_sync(r);
+                self.rescan(); // the new commit moves the note's updated date
                 self.check_conflict();
                 return self.next_job();
             }
@@ -693,6 +840,11 @@ impl App {
                 return window::close(id);
             }
             Message::DismissError => self.error = None,
+            Message::ShowSyncError => {
+                if let Sync::Error(e) = &self.sync {
+                    self.error = Some(e.clone());
+                }
+            }
             Message::RemoveTag(tag) => {
                 if let Some(n) = self.note.as_mut() {
                     n.front.tags.retain(|t| *t != tag);
@@ -710,6 +862,19 @@ impl App {
                 self.menu_open = false;
             }
             Message::ToggleMenu => self.menu_open = !self.menu_open,
+            Message::CheckUpdate => return self.check_update(),
+            // offline at startup is no error worth a banner: the menu item says it
+            Message::UpdateChecked(r) => {
+                self.update = match r {
+                    Ok(Some(v)) => Update::Available(v),
+                    Ok(None) => Update::UpToDate,
+                    Err(_) => Update::Failed,
+                }
+            }
+            Message::OpenReleases => {
+                widget::open_url(update::RELEASES);
+                self.menu_open = false;
+            }
             Message::ThemeColor(key, value) => {
                 if let Some(field) = self.config.theme.get_mut(key) {
                     *field = value;
@@ -854,7 +1019,7 @@ impl App {
                     self.fail(e);
                 }
                 self.check_conflict();
-                self.sync = Sync::Error(MERGE_ABORTED.into());
+                self.set_sync(Err(MERGE_ABORTED.into()));
             }
             Message::ConflictFinish => {
                 let Some(dir) = self.repo_dir() else { return Task::none() };
@@ -887,6 +1052,19 @@ impl App {
     fn conflict_file(&mut self) -> Option<&mut conflict::Kind> {
         let c = self.conflict.as_mut()?;
         c.files.get_mut(c.selected).map(|f| &mut f.kind)
+    }
+
+    fn publish(&mut self, url: String) -> Task<Message> {
+        let url = url.trim().to_string();
+        let Some(dir) = self.repo_dir().filter(|_| !url.is_empty()) else { return Task::none() };
+        if self.git_busy {
+            self.fail("Wait for the sync to finish, then publish again.");
+            return Task::none();
+        }
+        self.git_busy = true;
+        self.sync = Sync::Busy;
+        let at = dir.clone();
+        Task::perform(async move { git::publish(&dir, &url).map(|_| url) }, move |r| Message::Published(at.clone(), r))
     }
 
     fn clone_repo(&mut self) -> Task<Message> {
@@ -932,7 +1110,7 @@ impl App {
             ]
             .spacing(12)
             .align_y(iced::Center),
-            text("Clone a git repository to keep your notes in. Private repositories work with your existing SSH keys or git credential helper.")
+            text("Clone a git repository to keep your notes in, or open a local folder (it becomes a git repository you can publish later). Private repositories work with your existing SSH keys or git credential helper.")
                 .size(14)
                 .color(p.muted),
             column![
@@ -971,6 +1149,7 @@ impl App {
         card = card.push(
             row![
                 space::horizontal(),
+                btn(Some(i::BOOK), "Open local folder…", p.secondary()).on_press_maybe((!form.busy).then_some(Message::AddLocalRepo)),
                 btn(None, "Cancel", p.ghost()).on_press_maybe((!form.busy).then_some(Message::AddRepoCancel)),
                 btn(Some(i::REFRESH), if form.busy { "Cloning…" } else { "Clone" }, p.primary())
                     .on_press_maybe(ready.then_some(Message::AddRepoSubmit)),
@@ -990,6 +1169,9 @@ impl App {
     fn submit(&mut self, kind: DialogKind, value: String) -> Task<Message> {
         if kind == DialogKind::Link {
             return self.update(Message::Format(Action::SetLink(value)));
+        }
+        if kind == DialogKind::Publish {
+            return self.publish(value);
         }
         if matches!(kind, DialogKind::AddTag | DialogKind::TagColor) {
             let Some(tag) = tags::valid_tag(&value) else {
@@ -1052,7 +1234,7 @@ impl App {
                     }
                 }
             }
-            DialogKind::Link | DialogKind::AddTag | DialogKind::TagColor => unreachable!(),
+            DialogKind::Link | DialogKind::AddTag | DialogKind::TagColor | DialogKind::Publish => unreachable!(),
         };
         match result {
             Ok((open, msg)) => {
@@ -1086,7 +1268,7 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let p = self.config.theme.pal();
-        let has_repo = self.config.active().is_some();
+        let has_repo = self.repo_dir().is_some();
 
         // ---- top bar
         let logo = container(svg(theme::logo(&p, false)).width(36).height(36)).id(LOGO_ID);
@@ -1108,10 +1290,10 @@ impl App {
         .padding([4, 10])
         .style(p.group());
         let (status_icon, status_color, status) = match &self.sync {
-            Sync::Error(e) => (i::ALERT, p.danger, e.lines().last().unwrap_or("error").to_string()),
-            Sync::Busy => (i::REFRESH, p.muted, "syncing…".into()),
-            Sync::Idle if self.note.as_ref().is_some_and(OpenNote::dirty) => (i::PENCIL, p.faint, "unsaved".into()),
-            Sync::Idle => (i::CHECK, p.signal, "synced".into()),
+            Sync::Error(_) => (i::ALERT, p.danger, "sync failed"),
+            Sync::Busy => (i::REFRESH, p.muted, "syncing…"),
+            Sync::Idle if self.note.as_ref().is_some_and(OpenNote::dirty) => (i::PENCIL, p.faint, "unsaved"),
+            Sync::Idle => (i::CHECK, p.signal, "synced"),
         };
         let status = row![
             icon(status_icon).size(14).color(status_color),
@@ -1124,10 +1306,19 @@ impl App {
                 logo,
                 repo,
                 btn(Some(i::PLUS), "Add repo", p.ghost()).on_press(Message::AddRepoOpen),
-                btn(Some(i::MINUS), "Remove repo", p.ghost_with(p.muted, false)).on_press_maybe(has_repo.then_some(Message::RemoveRepo)),
+                btn(Some(i::MINUS), "Remove repo", p.ghost_with(p.muted, false)).on_press_maybe(self.config.active().is_some().then_some(Message::RemoveRepo)),
                 space::horizontal(),
-                container(status).max_width(420),
+                matches!(self.update, Update::Available(_))
+                    .then(|| btn(Some(i::REFRESH), "Update available", p.ghost_with(p.signal, false)).on_press(Message::OpenReleases)),
+                button(status)
+                    .padding(0)
+                    .style(p.bare(p.text))
+                    .on_press_maybe(matches!(self.sync, Sync::Error(_)).then_some(Message::ShowSyncError)),
                 btn(Some(i::REFRESH), "Sync", p.primary()).on_press_maybe(has_repo.then_some(Message::SyncNow)),
+                self.config
+                    .active()
+                    .is_some_and(|r| r.url.is_empty())
+                    .then(|| btn(Some(i::UPLOAD), "Publish…", p.secondary()).on_press_maybe(has_repo.then_some(Message::Dialog(DialogKind::Publish)))),
                 btn(Some(i::UPLOAD), "Export…", p.secondary()).on_press_maybe(has_repo.then_some(Message::Export)),
             ]
             .spacing(8)
@@ -1155,8 +1346,28 @@ impl App {
                 ]
                 .spacing(8)
                 .padding(12),
+                container(
+                    pick_list(&Sort::ALL[..], Some(self.sort), Message::SortBy)
+                        .width(Fill)
+                        .text_size(13)
+                        .padding([6, 10])
+                        .style(p.pick())
+                        .menu_style(p.menu()),
+                )
+                .padding(iced::Padding::ZERO.left(12.0).right(12.0).bottom(12.0)),
                 rule::horizontal(1).style(p.rule()),
-                scrollable(column(self.tree_view(&self.tree, p)).spacing(2).padding(12)).height(Fill),
+                scrollable(column(match self.sort {
+                    Sort::Folders => self.tree_view(&self.tree, p),
+                    Sort::Notes => {
+                        let mut flat = vec![];
+                        flatten(&self.tree, &mut flat);
+                        flat.sort_by_key(|n| std::cmp::Reverse(notes::updated(n)));
+                        self.tree_view(flat, p)
+                    }
+                })
+                .spacing(2)
+                .padding(12))
+                .height(Fill),
                 rule::horizontal(1).style(p.rule()),
                 row![
                     text(selected_name).size(13).color(p.muted).width(Fill).wrapping(text::Wrapping::None),
@@ -1174,21 +1385,6 @@ impl App {
 
         // ---- main panel
         let mut main = column![];
-        if let Some(e) = &self.error {
-            main = main.push(
-                container(
-                    row![
-                        icon(i::ALERT).color(p.danger),
-                        text(e.as_str()).size(13).color(p.danger).width(Fill),
-                        button(icon(i::X).color(p.muted)).style(p.ghost()).on_press(Message::DismissError),
-                    ]
-                    .spacing(8)
-                    .align_y(iced::Center),
-                )
-                .padding([8, 12]),
-            );
-            main = main.push(rule::horizontal(1).style(p.rule()));
-        }
         if let Some(dialog) = self.dialog_bar(p) {
             main = main.push(dialog).push(rule::horizontal(1).style(p.rule()));
         }
@@ -1205,9 +1401,13 @@ impl App {
                     .or_else(|| self.config.active().map(|r| r.name.clone()))
                     .unwrap_or_default();
                 let title = n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let dates = self.dates.get(&notes::md_path(&n.dir)).map(|d| {
+                    text(format!("Created {}  ·  Updated {}", d.created.label, d.updated.label)).font(theme::MONO).size(12).color(p.faint)
+                });
                 let page = column![
                     text(crumbs).font(theme::MONO).size(12).color(p.faint),
                     self.title(title, p),
+                    dates,
                     self.tag_bar(n, p),
                     rule::horizontal(1).style(p.rule()),
                     widget::view(&n.editor, &n.dir, p, Message::Editor),
@@ -1225,7 +1425,13 @@ impl App {
                 column![
                     svg(theme::logo(&p, false)).width(64).height(64),
                     text("Yana").size(36).font(weight(Semibold)),
-                    text(if has_repo { "Select or create a note" } else { "Add a git repository to start" }).color(p.muted),
+                    text(if has_repo {
+                        "Select or create a note"
+                    } else if self.config.active().is_some() {
+                        "This repository's folder is missing"
+                    } else {
+                        "Add a git repository to start"
+                    }).color(p.muted),
                 ]
                 .spacing(12)
                 .align_x(iced::Center),
@@ -1242,7 +1448,17 @@ impl App {
         if self.menu_open {
             // dropdown under the logo; clicking anywhere else closes it
         let item = row![icon(i::PALETTE), text("Theme").size(14).font(weight(Medium))].spacing(8).align_y(iced::Center);
-        let menu = container(button(item).width(Fill).padding([9, 12]).style(p.ghost_with(p.text, self.show_theme)).on_press(Message::ToggleTheme))
+        let theme_item = button(item).width(Fill).padding([9, 12]).style(p.ghost_with(p.text, self.show_theme)).on_press(Message::ToggleTheme);
+        let (label, color, press) = match &self.update {
+            Update::Available(v) => (format!("Update to v{v}"), p.signal, Some(Message::OpenReleases)),
+            Update::Checking => ("Checking…".into(), p.text, None),
+            Update::UpToDate => ("Up to date".into(), p.text, Some(Message::CheckUpdate)),
+            Update::Failed => ("Couldn't check for updates".into(), p.text, Some(Message::CheckUpdate)),
+            Update::Unknown => ("Check for updates".into(), p.text, Some(Message::CheckUpdate)),
+        };
+        let item = row![icon(i::REFRESH), text(label).size(14).font(weight(Medium))].spacing(8).align_y(iced::Center);
+        let update_item = button(item).width(Fill).padding([9, 12]).style(p.ghost_with(color, false)).on_press_maybe(press);
+        let menu = container(column![theme_item, update_item])
             .width(200)
             .padding(4)
             .style(move |t: &Theme| container::Style {
@@ -1263,6 +1479,25 @@ impl App {
             let backdrop = container(space().width(Fill).height(Fill)).style(p.fill(theme::alpha(Color::BLACK, 0.55), 0.0));
             layers.push(opaque(backdrop));
             layers.push(container(opaque(conflict::view(c, p))).center_x(Fill).height(Fill).padding([40, 48]).into());
+        }
+        if let Some(e) = &self.error {
+            let toast = container(
+                row![
+                    icon(i::ALERT).color(p.danger),
+                    text(e.as_str()).size(13).color(p.text).width(Fill),
+                    button(icon(i::X).color(p.muted)).style(p.ghost()).on_press(Message::DismissError),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            )
+            .width(420)
+            .padding([10, 12])
+            .style(move |t: &Theme| container::Style {
+                border: iced::Border { color: p.danger, width: 1.0, radius: 8.0.into() },
+                shadow: iced::Shadow { color: theme::alpha(Color::BLACK, 0.4), offset: iced::Vector::new(0.0, 6.0), blur_radius: 18.0 },
+                ..p.panel()(t)
+            });
+            layers.push(container(opaque(toast)).align_right(Fill).align_bottom(Fill).padding(24).into());
         }
         stack(layers).into()
     }
@@ -1302,6 +1537,7 @@ impl App {
             DialogKind::Link => ("Link URL", "https://… (empty removes the link)"),
             DialogKind::AddTag => ("Add tag", "tag name"),
             DialogKind::TagColor => ("Color for", ""),
+            DialogKind::Publish => ("Remote URL", "git@github.com:you/notes.git (an empty repository)"),
         };
         let input: Element<'_, Message> = if *kind == DialogKind::TagColor {
             text(value.clone()).font(theme::MONO).size(13).into()
@@ -1458,7 +1694,7 @@ impl App {
         .into()
     }
 
-    fn tree_view<'a>(&'a self, nodes: &'a [Node], p: Pal) -> Vec<Element<'a, Message>> {
+    fn tree_view<'a>(&'a self, nodes: impl IntoIterator<Item = &'a Node>, p: Pal) -> Vec<Element<'a, Message>> {
         let mut out = vec![];
         for node in nodes {
             let selected = self.selected.as_ref().is_some_and(|s| s == node_path(node));
@@ -1474,17 +1710,22 @@ impl App {
                     .align_y(iced::Center)
                     .into()
                 }
-                Node::Note { name, tags, .. } => row![
-                    dot(if selected { p.signal } else { p.faint }, 6.0),
-                    text(name.as_str())
-                        .size(14)
-                        .font(weight(if selected { Semibold } else { iced::font::Weight::Normal }))
-                        .width(Fill)
-                        .wrapping(text::Wrapping::None),
+                Node::Note { name, tags, dates, .. } => column![
+                    row![
+                        dot(if selected { p.signal } else { p.faint }, 6.0),
+                        text(name.as_str())
+                            .size(14)
+                            .font(weight(if selected { Semibold } else { iced::font::Weight::Normal }))
+                            .width(Fill)
+                            .wrapping(text::Wrapping::None),
+                    ]
+                    .extend(tags.iter().map(|t| dot(self.tags.color(t), 6.0)))
+                    .spacing(8)
+                    .align_y(iced::Center),
+                    // under the title: past the 6 px dot and 8 px gap
+                    dates.as_ref().map(|d| container(text(d.updated.label.as_str()).font(theme::MONO).size(11).color(p.faint)).padding(iced::Padding::ZERO.left(14.0))),
                 ]
-                .extend(tags.iter().map(|t| dot(self.tags.color(t), 6.0)))
-                .spacing(8)
-                .align_y(iced::Center)
+                .spacing(2)
                 .into(),
             };
             let msg = match node {
@@ -1532,6 +1773,32 @@ fn node_path(n: &Node) -> &PathBuf {
     }
 }
 
+/// (repo, HEAD) and the dates of every file at that HEAD, keyed by absolute path.
+type DatesAt = ((PathBuf, String), HashMap<PathBuf, history::Dates>);
+
+/// Dates at the current HEAD, or None if it is still `known`.
+fn read_dates(dir: PathBuf, known: &(PathBuf, String)) -> Result<Option<DatesAt>, String> {
+    // empty repo: no HEAD, no history
+    let head = git::run(&dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+    if dir == known.0 && head == known.1 {
+        return Ok(None);
+    }
+    // ponytail: walks the whole history per new commit; walk known..HEAD if repos get huge
+    let dates = if head.is_empty() { HashMap::new() } else { history::dates(&dir)? };
+    let dates = dates.into_iter().map(|(rel, d)| (dir.join(rel), d)).collect();
+    Ok(Some(((dir, head), dates)))
+}
+
+/// Every note under `nodes`, depth first.
+fn flatten<'a>(nodes: &'a [Node], out: &mut Vec<&'a Node>) {
+    for n in nodes {
+        match n {
+            Node::Folder { children, .. } => flatten(children, out),
+            Node::Note { .. } => out.push(n),
+        }
+    }
+}
+
 fn count_notes(nodes: &[Node]) -> usize {
     nodes
         .iter()
@@ -1567,7 +1834,32 @@ mod ui_tests {
         notes::create_note(&work, "Other").unwrap();
         let plan = notes::create_note(&work, "Plan").unwrap();
         std::fs::write(notes::md_path(&plan), "---\ntags: [facilo]\n---\n\nHello **world**\n\n- one\n- two\n").unwrap();
+        git::run(&root, &["init", "-q"]).unwrap();
         root
+    }
+
+    #[test]
+    fn missing_repo_folder_disables_notes() {
+        let root = temp_repo("missing");
+        let mut app = app(&root);
+        assert!(app.repo_dir().is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+        let _ = app.open_repo();
+        assert!(app.repo_dir().is_none() && app.tree.is_empty());
+        assert!(matches!(&app.sync, Sync::Error(e) if e.contains("missing")));
+        assert!(app.error.as_ref().is_some_and(|e| e.contains("missing")), "toasted");
+        let _ = app.update(Message::DismissError);
+        let _ = app.open_repo();
+        assert!(app.error.is_none(), "same error doesn't toast twice");
+        let _ = app.update(Message::ShowSyncError);
+        assert!(app.error.is_some(), "status click re-shows it");
+        app.config.repos.clear();
+        let _ = app.open_repo();
+        assert!(matches!(app.sync, Sync::Idle), "no repo, no stale error");
+        let _ = app.update(Message::Dialog(DialogKind::NewNote));
+        let _ = app.update(Message::DialogInput("x".into()));
+        let _ = app.update(Message::DialogSubmit);
+        assert!(!root.exists(), "never recreates the folder");
     }
 
     fn app(root: &Path) -> App {
@@ -1653,6 +1945,8 @@ mod ui_tests {
     fn logo_menu_opens_theme() {
         let root = temp_repo("menu");
         let mut app = app(&root);
+        app.update = Update::Available("9.9.9".into());
+        assert!(Simulator::with_size(settings(), (1280.0, 820.0), app.view()).find("Update available").is_ok(), "update notice in the top bar");
         click_target(&mut app, iced_test::selector::id(LOGO_ID));
         assert!(app.menu_open);
         {
@@ -1857,5 +2151,41 @@ mod ui_tests {
         assert_ne!(std::fs::read_to_string(&md).unwrap(), before, "saves resume after the pull");
         std::fs::remove_dir_all(&root).unwrap();
     }
-}
 
+    #[test]
+    fn notes_sorted_by_recency() {
+        let root = temp_repo("recency");
+        let commit = |date: &str, msg: &str| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", msg])
+                .env("GIT_AUTHOR_DATE", date)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        git::run(&root, &["init", "-q"]).unwrap();
+        git::run(&root, &["add", "-A"]).unwrap();
+        commit("2026-01-02T10:00:00", "created");
+        let facilo = root.join("Work/Tribe/Facilo");
+        std::fs::write(notes::md_path(&facilo.join("Other")), "newer\n").unwrap();
+        git::run(&root, &["add", "-A"]).unwrap();
+        commit("2026-03-04T10:00:00", "updated Other.md");
+
+        let mut app = app(&root);
+        let _ = app.update(Message::DatesLoaded(read_dates(root.clone(), &app.dates_at)));
+        let Node::Folder { children, .. } = &app.tree[0] else { panic!() };
+        let Node::Folder { children, .. } = &children[0] else { panic!() };
+        let Node::Folder { children, .. } = &children[0] else { panic!() };
+        let names: Vec<_> = children.iter().map(Node::name).collect();
+        assert_eq!(names, ["Other", "Plan"], "most recently updated first");
+        let other = &app.dates[&notes::md_path(&facilo.join("Other"))];
+        assert_eq!((other.created.label.as_str(), other.updated.label.as_str()), ("02 Jan 2026 10:00", "04 Mar 2026 10:00"));
+
+        let _ = app.update(Message::SortBy(Sort::Notes));
+        let _ = app.update(Message::Open(facilo.join("Other")));
+        snap(&app, "recency");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

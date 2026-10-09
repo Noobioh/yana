@@ -670,7 +670,7 @@ fn vertical(laid: &[Laid], c: Pos, down: bool) -> Pos {
     Pos { block: j, offset }
 }
 
-fn open_url(url: &str) {
+pub fn open_url(url: &str) {
     // only web/mail links; never hand a local path to the OS opener
     if !["http://", "https://", "mailto:"].iter().any(|s| url.starts_with(s)) {
         return;

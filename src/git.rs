@@ -62,7 +62,37 @@ pub fn merge_text(mine: &str, base: &str, theirs: &str) -> Result<(String, bool)
 pub fn clone(url: &str, dest: &Path) -> Result<(), String> {
     let parent = dest.parent().unwrap();
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    run(parent, &["clone", url, &dest.to_string_lossy()]).map(drop)
+    // `--`: a URL like `--upload-pack=…` must not become an option
+    run(parent, &["clone", "--", url, &dest.to_string_lossy()]).map(drop)
+}
+
+fn has_remote(dir: &Path) -> bool {
+    run(dir, &["remote", "get-url", "origin"]).is_ok()
+}
+
+/// Use a local folder as a repo, `git init`-ing it if needed: its `origin`
+/// URL, or "" when it has none.
+pub fn open_local(dir: &Path) -> Result<String, String> {
+    // check `.git` itself: a folder inside another repo gets its own
+    if !dir.join(".git").exists() {
+        run(dir, &["init", "-q"])?;
+    }
+    // publishing needs a commit to push
+    if run(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_err() {
+        run(dir, &["commit", "-q", "--allow-empty", "-m", "created repository"])?;
+    }
+    Ok(run(dir, &["remote", "get-url", "origin"]).map(|u| u.trim().to_string()).unwrap_or_default())
+}
+
+/// Push a local-only repo to `url` (an empty remote) and track it.
+pub fn publish(dir: &Path, url: &str) -> Result<(), String> {
+    run(dir, &["remote", "add", "--", "origin", url])?;
+    let result = commit_push(dir, "updated notes");
+    if result.is_err() {
+        // stay local, or every save would fail to push
+        let _ = run(dir, &["remote", "remove", "origin"]);
+    }
+    result
 }
 
 fn has_upstream(dir: &Path) -> bool {
@@ -121,6 +151,9 @@ pub fn commit_push(dir: &Path, msg: &str) -> Result<(), String> {
     if !run(dir, &["status", "--porcelain"])?.trim().is_empty() {
         run(dir, &["commit", "-m", msg])?;
     }
+    if !has_remote(dir) {
+        return Ok(());
+    }
     if has_upstream(dir) && run(dir, &["rev-list", "--count", "@{u}..HEAD"])?.trim() == "0" {
         return Ok(());
     }
@@ -167,6 +200,36 @@ mod tests {
         // nothing changed: no new commit
         commit_push(&a, "updated one.md").unwrap();
         assert_eq!(run(&root.join("remote.git"), &["rev-list", "--count", "HEAD"]).unwrap().trim(), "3");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn local_repo_commits_then_publishes() {
+        let root = std::env::temp_dir().join(format!("ez-notes-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        run(&local, &["init", "-q"]).unwrap();
+        run(&local, &["config", "user.email", "t@t"]).unwrap();
+        run(&local, &["config", "user.name", "t"]).unwrap();
+        assert_eq!(open_local(&local).unwrap(), ""); // empty commit, no remote
+        std::fs::write(local.join("one.md"), "1").unwrap();
+        commit_push(&local, "updated one.md").unwrap(); // no remote: commit only
+        assert_eq!(run(&local, &["rev-list", "--count", "HEAD"]).unwrap().trim(), "2");
+
+        assert!(publish(&local, &root.join("missing.git").to_string_lossy()).is_err());
+        assert!(!has_remote(&local), "failed publish stays local");
+
+        run(&root, &["init", "--bare", "-q", "remote.git"]).unwrap();
+        let url = root.join("remote.git").to_string_lossy().into_owned();
+        std::fs::write(local.join("two.md"), "2").unwrap();
+        publish(&local, &url).unwrap();
+        assert_eq!(open_local(&local).unwrap(), url);
+        let remote = root.join("remote.git");
+        assert_eq!(run(&remote, &["rev-list", "--count", "HEAD"]).unwrap().trim(), "3");
+        std::fs::write(local.join("one.md"), "1b").unwrap();
+        commit_push(&local, "updated one.md").unwrap();
+        assert_eq!(run(&remote, &["show", "HEAD:one.md"]).unwrap(), "1b");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

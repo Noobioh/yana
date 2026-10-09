@@ -1,6 +1,9 @@
 //! Notes on disk: a note is a folder `<Name>/` holding `<Name>.md` plus its
 //! assets; any other folder is just a folder and can nest without limit.
 
+use crate::history::Dates;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,7 +11,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub enum Node {
     Folder { name: String, path: PathBuf, children: Vec<Node> },
-    Note { name: String, path: PathBuf, tags: Vec<String> },
+    /// `dates` is None until the note is first committed.
+    Note { name: String, path: PathBuf, tags: Vec<String>, dates: Option<Dates> },
 }
 
 impl Node {
@@ -28,7 +32,9 @@ pub fn is_note(dir: &Path) -> bool {
     md_path(dir).is_file()
 }
 
-pub fn scan(dir: &Path) -> Vec<Node> {
+/// Folders first by name, then notes, most recently updated first.
+/// `dates` is keyed by `.md` path.
+pub fn scan(dir: &Path, dates: &HashMap<PathBuf, Dates>) -> Vec<Node> {
     let mut nodes: Vec<Node> = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -38,14 +44,22 @@ pub fn scan(dir: &Path) -> Vec<Node> {
             let name = e.file_name().into_string().ok().filter(|n| !n.starts_with('.'))?;
             let path = e.path();
             Some(if is_note(&path) {
-                Node::Note { tags: note_tags(&path), name, path }
+                Node::Note { tags: note_tags(&path), dates: dates.get(&md_path(&path)).cloned(), name, path }
             } else {
-                Node::Folder { name, children: scan(&path), path }
+                Node::Folder { name, children: scan(&path, dates), path }
             })
         })
         .collect();
-    nodes.sort_by_key(|n| (matches!(n, Node::Note { .. }), n.name().to_lowercase()));
+    nodes.sort_by_key(|n| (matches!(n, Node::Note { .. }), Reverse(updated(n)), n.name().to_lowercase()));
     nodes
+}
+
+/// Sort key: uncommitted notes count as newest, folders all tie.
+pub fn updated(n: &Node) -> i64 {
+    match n {
+        Node::Note { dates, .. } => dates.as_ref().map_or(i64::MAX, |d| d.updated.secs),
+        Node::Folder { .. } => 0,
+    }
 }
 
 fn note_tags(dir: &Path) -> Vec<String> {
@@ -143,7 +157,7 @@ mod tests {
         assert_eq!(import_image(&note, &img).unwrap(), "pic-1.png");
         let renamed = rename(&note, "Roadmap").unwrap();
         assert!(md_path(&renamed).is_file() && renamed.join("pic-1.png").is_file());
-        let tree = scan(&root);
+        let tree = scan(&root, &HashMap::new());
         assert!(matches!(&tree[0], Node::Folder { children, .. } if matches!(&children[0], Node::Note { name, .. } if name == "Roadmap")));
         assert!(valid_name("../x").is_err() && valid_name(".hidden").is_err());
         fs::remove_dir_all(&root).unwrap();
