@@ -20,7 +20,7 @@ use iced::widget::{button, center, column, container, mouse_area, opaque, operat
 use iced::{Border, Color, Element, Fill, Subscription, Task, Theme, time, window};
 use tags::{Front, TagsFile};
 use notes::Node;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,28 @@ fn repo_name_from_url(url: &str) -> String {
     if name.is_empty() { "notes".into() } else { name.into() }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Sort {
+    /// The folder tree; notes in each folder most recent first.
+    #[default]
+    Folders,
+    /// Every note in one list, most recent first.
+    Notes,
+}
+
+impl Sort {
+    const ALL: [Sort; 2] = [Sort::Folders, Sort::Notes];
+}
+
+impl std::fmt::Display for Sort {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Sort::Folders => "Sort folders on recency",
+            Sort::Notes => "Sort notes on recency",
+        })
+    }
+}
+
 #[derive(Default)]
 enum Sync {
     #[default]
@@ -127,6 +149,14 @@ enum Sync {
 struct App {
     config: Config,
     tree: Vec<Node>,
+    sort: Sort,
+    /// Created/updated per `.md` path, from git history.
+    dates: HashMap<PathBuf, history::Dates>,
+    /// (repo, HEAD) the dates were read at: history only changes with HEAD.
+    dates_at: (PathBuf, String),
+    /// The tree was rescanned since the last dates check.
+    dates_stale: bool,
+    dates_loading: bool,
     expanded: HashSet<PathBuf>,
     selected: Option<PathBuf>,
     note: Option<OpenNote>,
@@ -163,6 +193,9 @@ enum Message {
     AutoPull,
     AutoPulled(Result<(), String>),
     SelectRepo(Repo),
+    SortBy(Sort),
+    /// None: HEAD hadn't moved.
+    DatesLoaded(Result<Option<DatesAt>, String>),
     Toggle(PathBuf),
     Open(PathBuf),
     Dialog(DialogKind),
@@ -217,7 +250,8 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let mut app = App { config: Config::load(), ..App::default() };
         let task = app.open_repo();
-        (app, task)
+        let dates = app.load_dates();
+        (app, Task::batch([task, dates]))
     }
 
     fn repo_dir(&self) -> Option<PathBuf> {
@@ -225,7 +259,8 @@ impl App {
     }
 
     fn rescan(&mut self) {
-        self.tree = self.repo_dir().map(|d| notes::scan(&d)).unwrap_or_default();
+        self.dates_stale = true; // a commit may have moved dates; update() checks in the background
+        self.tree = self.repo_dir().map(|d| notes::scan(&d, &self.dates)).unwrap_or_default();
         self.tags = self.repo_dir().map(|d| TagsFile::load(&d)).unwrap_or_default();
     }
 
@@ -403,6 +438,20 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        Task::batch([task, self.load_dates()])
+    }
+
+    /// Re-read note dates off the UI thread after a rescan, one load at a time.
+    fn load_dates(&mut self) -> Task<Message> {
+        let Some(dir) = self.repo_dir().filter(|_| self.dates_stale && !self.dates_loading) else { return Task::none() };
+        self.dates_stale = false;
+        self.dates_loading = true;
+        let known = self.dates_at.clone();
+        Task::perform(async move { read_dates(dir, &known) }, Message::DatesLoaded)
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         let format = matches!(message, Message::Format(_));
         match message {
             Message::Editor(Action::RequestLink) | Message::Format(Action::RequestLink) => {
@@ -450,6 +499,18 @@ impl App {
                 self.note = None;
                 self.selected = None;
                 return Task::batch([save, self.open_repo()]);
+            }
+            Message::SortBy(sort) => self.sort = sort,
+            Message::DatesLoaded(r) => {
+                self.dates_loading = false;
+                // on error keep the old dates; the next rescan retries
+                if let Ok(Some((at, dates))) = r
+                    && self.repo_dir().as_ref() == Some(&at.0)
+                {
+                    self.dates = dates;
+                    self.dates_at = at;
+                    self.rescan();
+                }
             }
             Message::Toggle(path) => {
                 if !self.expanded.remove(&path) {
@@ -663,6 +724,7 @@ impl App {
                     Ok(()) => Sync::Idle,
                     Err(e) => Sync::Error(e),
                 };
+                self.rescan(); // the new commit moves the note's updated date
                 self.check_conflict();
                 return self.next_job();
             }
@@ -1155,8 +1217,28 @@ impl App {
                 ]
                 .spacing(8)
                 .padding(12),
+                container(
+                    pick_list(&Sort::ALL[..], Some(self.sort), Message::SortBy)
+                        .width(Fill)
+                        .text_size(13)
+                        .padding([6, 10])
+                        .style(p.pick())
+                        .menu_style(p.menu()),
+                )
+                .padding(iced::Padding::ZERO.left(12.0).right(12.0).bottom(12.0)),
                 rule::horizontal(1).style(p.rule()),
-                scrollable(column(self.tree_view(&self.tree, p)).spacing(2).padding(12)).height(Fill),
+                scrollable(column(match self.sort {
+                    Sort::Folders => self.tree_view(&self.tree, p),
+                    Sort::Notes => {
+                        let mut flat = vec![];
+                        flatten(&self.tree, &mut flat);
+                        flat.sort_by_key(|n| std::cmp::Reverse(notes::updated(n)));
+                        self.tree_view(flat, p)
+                    }
+                })
+                .spacing(2)
+                .padding(12))
+                .height(Fill),
                 rule::horizontal(1).style(p.rule()),
                 row![
                     text(selected_name).size(13).color(p.muted).width(Fill).wrapping(text::Wrapping::None),
@@ -1205,9 +1287,13 @@ impl App {
                     .or_else(|| self.config.active().map(|r| r.name.clone()))
                     .unwrap_or_default();
                 let title = n.dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let dates = self.dates.get(&notes::md_path(&n.dir)).map(|d| {
+                    text(format!("Created {}  ·  Updated {}", d.created.label, d.updated.label)).font(theme::MONO).size(12).color(p.faint)
+                });
                 let page = column![
                     text(crumbs).font(theme::MONO).size(12).color(p.faint),
                     self.title(title, p),
+                    dates,
                     self.tag_bar(n, p),
                     rule::horizontal(1).style(p.rule()),
                     widget::view(&n.editor, &n.dir, p, Message::Editor),
@@ -1458,7 +1544,7 @@ impl App {
         .into()
     }
 
-    fn tree_view<'a>(&'a self, nodes: &'a [Node], p: Pal) -> Vec<Element<'a, Message>> {
+    fn tree_view<'a>(&'a self, nodes: impl IntoIterator<Item = &'a Node>, p: Pal) -> Vec<Element<'a, Message>> {
         let mut out = vec![];
         for node in nodes {
             let selected = self.selected.as_ref().is_some_and(|s| s == node_path(node));
@@ -1474,17 +1560,22 @@ impl App {
                     .align_y(iced::Center)
                     .into()
                 }
-                Node::Note { name, tags, .. } => row![
-                    dot(if selected { p.signal } else { p.faint }, 6.0),
-                    text(name.as_str())
-                        .size(14)
-                        .font(weight(if selected { Semibold } else { iced::font::Weight::Normal }))
-                        .width(Fill)
-                        .wrapping(text::Wrapping::None),
+                Node::Note { name, tags, dates, .. } => column![
+                    row![
+                        dot(if selected { p.signal } else { p.faint }, 6.0),
+                        text(name.as_str())
+                            .size(14)
+                            .font(weight(if selected { Semibold } else { iced::font::Weight::Normal }))
+                            .width(Fill)
+                            .wrapping(text::Wrapping::None),
+                    ]
+                    .extend(tags.iter().map(|t| dot(self.tags.color(t), 6.0)))
+                    .spacing(8)
+                    .align_y(iced::Center),
+                    // under the title: past the 6 px dot and 8 px gap
+                    dates.as_ref().map(|d| container(text(d.updated.label.as_str()).font(theme::MONO).size(11).color(p.faint)).padding(iced::Padding::ZERO.left(14.0))),
                 ]
-                .extend(tags.iter().map(|t| dot(self.tags.color(t), 6.0)))
-                .spacing(8)
-                .align_y(iced::Center)
+                .spacing(2)
                 .into(),
             };
             let msg = match node {
@@ -1529,6 +1620,32 @@ fn btn<'a>(
 fn node_path(n: &Node) -> &PathBuf {
     match n {
         Node::Folder { path, .. } | Node::Note { path, .. } => path,
+    }
+}
+
+/// (repo, HEAD) and the dates of every file at that HEAD, keyed by absolute path.
+type DatesAt = ((PathBuf, String), HashMap<PathBuf, history::Dates>);
+
+/// Dates at the current HEAD, or None if it is still `known`.
+fn read_dates(dir: PathBuf, known: &(PathBuf, String)) -> Result<Option<DatesAt>, String> {
+    // empty repo: no HEAD, no history
+    let head = git::run(&dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+    if dir == known.0 && head == known.1 {
+        return Ok(None);
+    }
+    // ponytail: walks the whole history per new commit; walk known..HEAD if repos get huge
+    let dates = if head.is_empty() { HashMap::new() } else { history::dates(&dir)? };
+    let dates = dates.into_iter().map(|(rel, d)| (dir.join(rel), d)).collect();
+    Ok(Some(((dir, head), dates)))
+}
+
+/// Every note under `nodes`, depth first.
+fn flatten<'a>(nodes: &'a [Node], out: &mut Vec<&'a Node>) {
+    for n in nodes {
+        match n {
+            Node::Folder { children, .. } => flatten(children, out),
+            Node::Note { .. } => out.push(n),
+        }
     }
 }
 
@@ -1857,5 +1974,41 @@ mod ui_tests {
         assert_ne!(std::fs::read_to_string(&md).unwrap(), before, "saves resume after the pull");
         std::fs::remove_dir_all(&root).unwrap();
     }
-}
 
+    #[test]
+    fn notes_sorted_by_recency() {
+        let root = temp_repo("recency");
+        let commit = |date: &str, msg: &str| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", msg])
+                .env("GIT_AUTHOR_DATE", date)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        git::run(&root, &["init", "-q"]).unwrap();
+        git::run(&root, &["add", "-A"]).unwrap();
+        commit("2026-01-02T10:00:00", "created");
+        let facilo = root.join("Work/Tribe/Facilo");
+        std::fs::write(notes::md_path(&facilo.join("Other")), "newer\n").unwrap();
+        git::run(&root, &["add", "-A"]).unwrap();
+        commit("2026-03-04T10:00:00", "updated Other.md");
+
+        let mut app = app(&root);
+        let _ = app.update(Message::DatesLoaded(read_dates(root.clone(), &app.dates_at)));
+        let Node::Folder { children, .. } = &app.tree[0] else { panic!() };
+        let Node::Folder { children, .. } = &children[0] else { panic!() };
+        let Node::Folder { children, .. } = &children[0] else { panic!() };
+        let names: Vec<_> = children.iter().map(Node::name).collect();
+        assert_eq!(names, ["Other", "Plan"], "most recently updated first");
+        let other = &app.dates[&notes::md_path(&facilo.join("Other"))];
+        assert_eq!((other.created.label.as_str(), other.updated.label.as_str()), ("02 Jan 2026 10:00", "04 Mar 2026 10:00"));
+
+        let _ = app.update(Message::SortBy(Sort::Notes));
+        let _ = app.update(Message::Open(facilo.join("Other")));
+        snap(&app, "recency");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
