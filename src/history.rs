@@ -5,6 +5,7 @@ use crate::{Message, btn, git, notes};
 use iced::font::Weight::{Medium, Semibold};
 use iced::widget::{button, column, container, row, rule, scrollable, space, text};
 use iced::{Element, Fill};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Above this many diff lines, ask before rendering.
@@ -83,6 +84,65 @@ pub fn parse_log(out: &str, current: &str) -> Vec<Version> {
         });
     }
     versions
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stamp {
+    /// Unix seconds, for sorting.
+    pub secs: i64,
+    /// "08 Oct 2026 14:05", local time
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dates {
+    pub created: Stamp,
+    pub updated: Stamp,
+}
+
+/// Created/updated dates of every file, keyed by its current repo-relative
+/// path, from one walk over the whole history. Taken from git rather than
+/// front matter so concurrent edits never conflict on a date line.
+pub fn dates(repo: &Path) -> Result<HashMap<String, Dates>, String> {
+    // -z: paths raw, never C-quoted (a `"` in a note name would be)
+    let out = git::run(repo, &["log", "-z", "-M", "--name-status", "--format=%x1e%at%x1f%ad", "--date=format-local:%d %b %Y %H:%M"])?;
+    Ok(parse_dates(&out))
+}
+
+pub fn parse_dates(out: &str) -> HashMap<String, Dates> {
+    // newest commit first: the first sighting is the last update, the last one the creation
+    let mut found: HashMap<String, (Option<Stamp>, Stamp)> = HashMap::new();
+    // older path -> current path, from renames seen so far
+    let mut alias: HashMap<String, String> = HashMap::new();
+    for rec in out.split('\x1e').filter(|r| !r.trim().is_empty()) {
+        // "<secs>\x1f<date>\0\nM\0path\0R087\0old\0new\0"
+        let mut fields = rec.split('\0').map(|f| f.trim_start_matches('\n')).filter(|f| !f.is_empty());
+        let Some((secs, label)) = fields.next().and_then(|h| h.split_once('\x1f')) else { continue };
+        let Ok(secs) = secs.parse() else { continue };
+        let stamp = Stamp { secs, label: label.to_string() };
+        while let (Some(status), Some(first)) = (fields.next(), fields.next()) {
+            let (path, old) = if status.starts_with(['R', 'C']) {
+                let Some(new) = fields.next() else { break };
+                (new, Some(first))
+            } else {
+                (first, None)
+            };
+            if status == "D" {
+                continue;
+            }
+            let key = alias.get(path).cloned().unwrap_or_else(|| path.to_string());
+            let entry = found.entry(key.clone()).or_insert((None, stamp.clone()));
+            // a pure move (renamed note or folder) is not an edit
+            if status != "R100" && entry.0.is_none() {
+                entry.0 = Some(stamp.clone());
+            }
+            entry.1 = stamp.clone();
+            if let Some(old) = old {
+                alias.insert(old.to_string(), key);
+            }
+        }
+    }
+    found.into_iter().map(|(k, (updated, created))| (k, Dates { updated: updated.unwrap_or_else(|| created.clone()), created })).collect()
 }
 
 /// Diff for `versions[idx]` in the given mode.
@@ -269,6 +329,19 @@ mod tests {
         assert_eq!((v[0].short.as_str(), v[0].path.as_str()), ("a", "Work/Road/Road.md"));
         assert_eq!(v[1].path, "Work/Road/Road.md", "merge keeps newer path");
         assert_eq!((v[2].author.as_str(), v[2].path.as_str()), ("Jo", "Work/Plan/Plan.md"));
+    }
+
+    #[test]
+    fn dates_follow_renames() {
+        let out = "\x1e400\x1fd4\0\nR100\0Work/Plan/Plan.md\0Work/Road/Road.md\0M\0Other/Other.md\0\
+                   \x1e300\x1fd3\0\x1e200\x1fd2\0\nM\0Work/Plan/Plan.md\0\
+                   \x1e100\x1fd1\0\nA\0Work/Plan/Plan.md\0A\0Q \"x\"/Q \"x\".md\0";
+        let d = parse_dates(out);
+        let road = &d["Work/Road/Road.md"];
+        assert_eq!((road.created.secs, road.updated.secs), (100, 200), "pure rename is not an update");
+        assert_eq!(d["Other/Other.md"].updated.label, "d4");
+        assert_eq!(d["Q \"x\"/Q \"x\".md"].created.label, "d1", "quotes stay raw");
+        assert!(!d.contains_key("Work/Plan/Plan.md"));
     }
 
     #[test]
