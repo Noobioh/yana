@@ -11,6 +11,7 @@ mod notes;
 mod pdf;
 mod tags;
 mod theme;
+mod update;
 mod widget;
 
 use config::{Config, Repo};
@@ -137,6 +138,17 @@ impl std::fmt::Display for Sort {
     }
 }
 
+/// Outcome of asking GitHub for a newer release.
+#[derive(Default)]
+enum Update {
+    #[default]
+    Unknown,
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed,
+}
+
 #[derive(Default)]
 enum Sync {
     #[default]
@@ -182,6 +194,7 @@ struct App {
     conflict: Option<conflict::Conflict>,
     /// A pull is rewriting the working tree: hold off writing notes.
     pulling: bool,
+    update: Update,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +257,9 @@ enum Message {
     ConflictEdit(text_editor::Action),
     ConflictAbort,
     ConflictFinish,
+    CheckUpdate,
+    UpdateChecked(Result<Option<String>, String>),
+    OpenReleases,
 }
 
 impl App {
@@ -251,7 +267,13 @@ impl App {
         let mut app = App { config: Config::load(), ..App::default() };
         let task = app.open_repo();
         let dates = app.load_dates();
-        (app, Task::batch([task, dates]))
+        let update = app.check_update();
+        (app, Task::batch([task, dates, update]))
+    }
+
+    fn check_update(&mut self) -> Task<Message> {
+        self.update = Update::Checking;
+        Task::perform(async { update::check() }, Message::UpdateChecked)
     }
 
     fn repo_dir(&self) -> Option<PathBuf> {
@@ -772,6 +794,19 @@ impl App {
                 self.menu_open = false;
             }
             Message::ToggleMenu => self.menu_open = !self.menu_open,
+            Message::CheckUpdate => return self.check_update(),
+            // offline at startup is no error worth a banner: the menu item says it
+            Message::UpdateChecked(r) => {
+                self.update = match r {
+                    Ok(Some(v)) => Update::Available(v),
+                    Ok(None) => Update::UpToDate,
+                    Err(_) => Update::Failed,
+                }
+            }
+            Message::OpenReleases => {
+                widget::open_url(update::RELEASES);
+                self.menu_open = false;
+            }
             Message::ThemeColor(key, value) => {
                 if let Some(field) = self.config.theme.get_mut(key) {
                     *field = value;
@@ -1188,6 +1223,8 @@ impl App {
                 btn(Some(i::PLUS), "Add repo", p.ghost()).on_press(Message::AddRepoOpen),
                 btn(Some(i::MINUS), "Remove repo", p.ghost_with(p.muted, false)).on_press_maybe(has_repo.then_some(Message::RemoveRepo)),
                 space::horizontal(),
+                matches!(self.update, Update::Available(_))
+                    .then(|| btn(Some(i::REFRESH), "Update available", p.ghost_with(p.signal, false)).on_press(Message::OpenReleases)),
                 container(status).max_width(420),
                 btn(Some(i::REFRESH), "Sync", p.primary()).on_press_maybe(has_repo.then_some(Message::SyncNow)),
                 btn(Some(i::UPLOAD), "Export…", p.secondary()).on_press_maybe(has_repo.then_some(Message::Export)),
@@ -1328,7 +1365,17 @@ impl App {
         if self.menu_open {
             // dropdown under the logo; clicking anywhere else closes it
         let item = row![icon(i::PALETTE), text("Theme").size(14).font(weight(Medium))].spacing(8).align_y(iced::Center);
-        let menu = container(button(item).width(Fill).padding([9, 12]).style(p.ghost_with(p.text, self.show_theme)).on_press(Message::ToggleTheme))
+        let theme_item = button(item).width(Fill).padding([9, 12]).style(p.ghost_with(p.text, self.show_theme)).on_press(Message::ToggleTheme);
+        let (label, color, press) = match &self.update {
+            Update::Available(v) => (format!("Update to v{v}"), p.signal, Some(Message::OpenReleases)),
+            Update::Checking => ("Checking…".into(), p.text, None),
+            Update::UpToDate => ("Up to date".into(), p.text, Some(Message::CheckUpdate)),
+            Update::Failed => ("Couldn't check for updates".into(), p.text, Some(Message::CheckUpdate)),
+            Update::Unknown => ("Check for updates".into(), p.text, Some(Message::CheckUpdate)),
+        };
+        let item = row![icon(i::REFRESH), text(label).size(14).font(weight(Medium))].spacing(8).align_y(iced::Center);
+        let update_item = button(item).width(Fill).padding([9, 12]).style(p.ghost_with(color, false)).on_press_maybe(press);
+        let menu = container(column![theme_item, update_item])
             .width(200)
             .padding(4)
             .style(move |t: &Theme| container::Style {
@@ -1770,6 +1817,8 @@ mod ui_tests {
     fn logo_menu_opens_theme() {
         let root = temp_repo("menu");
         let mut app = app(&root);
+        app.update = Update::Available("9.9.9".into());
+        assert!(Simulator::with_size(settings(), (1280.0, 820.0), app.view()).find("Update available").is_ok(), "update notice in the top bar");
         click_target(&mut app, iced_test::selector::id(LOGO_ID));
         assert!(app.menu_open);
         {
