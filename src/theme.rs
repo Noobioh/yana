@@ -440,6 +440,8 @@ pub mod i {
     pub const ARROW_LEFT: char = '\u{e04c}';
     pub const HISTORY: char = '\u{e1f5}';
     pub const GIT_MERGE: char = '\u{e0e7}';
+    pub const GLOBE: char = '\u{e0eb}';
+    pub const FOLDER_OPEN: char = '\u{e247}';
 }
 
 #[cfg(test)]

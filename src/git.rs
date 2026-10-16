@@ -165,6 +165,55 @@ pub fn commit_push(dir: &Path, msg: &str) -> Result<(), String> {
     run(dir, &["push", "-u", "origin", "HEAD"]).map(drop)
 }
 
+/// The checked-out branch; "HEAD" when detached or before the first commit.
+pub fn branch(dir: &Path) -> String {
+    run(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|b| b.trim().to_string()).unwrap_or_else(|_| "HEAD".into())
+}
+
+/// Web page of `rel` (repo-relative, `/`-separated) on `branch` at the
+/// remote's host, or None for remotes without one (local paths, `file://`).
+pub fn web_url(remote: &str, branch: &str, rel: &str) -> Option<String> {
+    let remote = remote.trim();
+    let (scheme, authority, path) = match remote.split_once("://") {
+        Some((scheme, rest)) if ["https", "http", "ssh", "git"].contains(&scheme) => {
+            let (authority, path) = rest.split_once('/')?;
+            // drop credentials and port: never put a token in a browser URL
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            (if scheme == "http" { "http" } else { "https" }, host.split(':').next().unwrap_or(""), path)
+        }
+        Some(_) => return None,
+        // scp-like `git@host:owner/repo`; a single letter is a Windows drive
+        None => {
+            let (authority, path) = remote.split_once(':')?;
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            if host.len() < 2 || host.contains(['/', '\\']) {
+                return None;
+            }
+            ("https", host, path)
+        }
+    };
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    if authority.is_empty() || path.is_empty() {
+        return None;
+    }
+    // ponytail: unknown hosts get GitHub's layout; add Gitea's `src/branch` when someone needs it
+    let blob = if authority.contains("gitlab") {
+        "-/blob"
+    } else if authority.contains("bitbucket") {
+        "src"
+    } else {
+        "blob"
+    };
+    Some(format!("{scheme}://{authority}/{path}/{blob}/{}/{}", encode(branch), encode(rel)))
+}
+
+/// Percent-encode everything but unreserved characters and `/`.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +280,22 @@ mod tests {
         commit_push(&local, "updated one.md").unwrap();
         assert_eq!(run(&remote, &["show", "HEAD:one.md"]).unwrap(), "1b");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn web_urls() {
+        let url = |remote| web_url(remote, "main", "Work/My note/My note.md");
+        let gh = Some("https://github.com/me/notes/blob/main/Work/My%20note/My%20note.md".to_string());
+        assert_eq!(url("git@github.com:me/notes.git"), gh);
+        assert_eq!(url("ssh://git@github.com:22/me/notes.git"), gh);
+        assert_eq!(url("https://me:token@github.com/me/notes.git/"), gh);
+        assert_eq!(url("https://github.com/me/notes"), gh);
+        assert_eq!(url("git@gitlab.com:group/sub/notes.git").unwrap(), "https://gitlab.com/group/sub/notes/-/blob/main/Work/My%20note/My%20note.md");
+        assert_eq!(url("https://me@bitbucket.org/me/notes.git").unwrap(), "https://bitbucket.org/me/notes/src/main/Work/My%20note/My%20note.md");
+        assert_eq!(web_url("git@github.com:me/notes.git", "feat/x", "é.md").unwrap(), "https://github.com/me/notes/blob/feat/x/%C3%A9.md");
+        for local in ["", "/srv/notes.git", "C:\\notes.git", "C:/notes.git", "file:///srv/notes.git", "../notes"] {
+            assert_eq!(url(local), None, "{local}");
+        }
     }
 
     #[test]
