@@ -224,6 +224,8 @@ enum Message {
     RemoveRepo,
     Export,
     ExportPdf,
+    OpenInBrowser,
+    ShowInFolder,
     InsertImage,
     SyncNow,
     /// Re-show the sync error after its toast was dismissed.
@@ -675,6 +677,18 @@ impl App {
                     && let Err(e) = pdf::export(&title, &n.editor.blocks, &n.dir, &dest)
                 {
                     self.fail(e);
+                }
+            }
+            Message::OpenInBrowser => {
+                let (Some(dir), Some(repo), Some(n)) = (self.repo_dir(), self.config.active(), &self.note) else { return Task::none() };
+                let rel = history::rel(&dir, &notes::md_path(&n.dir));
+                if let Some(url) = git::web_url(&repo.url, &git::branch(&dir), &rel) {
+                    widget::open_url(&url);
+                }
+            }
+            Message::ShowInFolder => {
+                if let Some(n) = &self.note {
+                    widget::reveal(&notes::md_path(&n.dir));
                 }
             }
             Message::InsertImage => {
@@ -1370,7 +1384,8 @@ impl App {
                 .height(Fill),
                 rule::horizontal(1).style(p.rule()),
                 row![
-                    text(selected_name).size(13).color(p.muted).width(Fill).wrapping(text::Wrapping::None),
+                    // unwrapped text draws past its bounds; clip long names instead of overlapping the buttons
+                    container(text(selected_name).size(13).color(p.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
                     btn(Some(i::PENCIL), "Rename", p.ghost()).on_press_maybe(selected.then_some(Message::Dialog(DialogKind::Rename))),
                     btn(Some(i::TRASH), "Delete", p.danger()).on_press_maybe(selected.then_some(Message::Delete)),
                 ]
@@ -1645,7 +1660,18 @@ impl App {
                 op("− Col", TableOp::RemoveColumn),
             ]));
         }
-        bar.push(space().width(Fill))
+        bar = bar.push(space().width(Fill));
+        if self.config.active().is_some_and(|r| git::web_url(&r.url, "", "").is_some()) {
+            bar = bar.push(btn(Some(i::GLOBE), "Browser", p.ghost()).on_press(Message::OpenInBrowser));
+        }
+        let files = if cfg!(target_os = "macos") {
+            "Finder"
+        } else if cfg!(windows) {
+            "Explorer"
+        } else {
+            "Folder"
+        };
+        bar.push(btn(Some(i::FOLDER_OPEN), files, p.ghost()).on_press(Message::ShowInFolder))
             .push(btn(Some(i::HISTORY), "History", p.ghost()).on_press(Message::HistoryOpen))
             .push(btn(Some(i::UPLOAD), "PDF", p.ghost()).on_press(Message::ExportPdf))
             .into()
