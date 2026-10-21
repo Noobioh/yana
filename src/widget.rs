@@ -685,6 +685,17 @@ pub fn open_url(url: &str) {
     let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
 
+/// Show `path` selected in the OS file manager (Linux: open its folder).
+pub fn reveal(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    // explorer misparses `/select,` when Rust quotes the whole argument
+    #[cfg(windows)]
+    let _ = std::os::windows::process::CommandExt::raw_arg(&mut std::process::Command::new("explorer"), format!("/select,\"{}\"", path.display())).spawn();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
